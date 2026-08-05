@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from sqlalchemy import Boolean, DateTime, Enum, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.constants import WalletType
 from app.db.database import Base
@@ -45,3 +46,9 @@ class Wallet(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
+    
+    holdings = relationship(
+    "Holding",
+    back_populates="wallet",
+    cascade="all, delete-orphan",
+)
