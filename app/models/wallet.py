@@ -47,6 +47,12 @@ class Wallet(Base):
         nullable=False,
     )
     
+    trades = relationship(
+    "Trade",
+    back_populates="wallet",
+    cascade="all, delete-orphan",
+)
+    
     holdings = relationship(
     "Holding",
     back_populates="wallet",
