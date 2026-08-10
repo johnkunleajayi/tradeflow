@@ -10,7 +10,8 @@ from app.schemas.portfolio import (
     PortfolioAssetResponse,
     PortfolioResponse,
 )
-from app.services.price_service import PriceService
+from app.services.providers.provider_factory import ProviderFactory
+from app.services.wallet_service import WalletService
 
 
 class PortfolioQueryService:
@@ -23,7 +24,7 @@ class PortfolioQueryService:
     - Dashboard data
     - Portfolio reporting
 
-    This service NEVER modifies data.
+    This service NEVER modifies portfolio data.
     """
 
     def __init__(self, db: Session):
@@ -31,16 +32,36 @@ class PortfolioQueryService:
 
         self.wallet_repository = WalletRepository(db)
         self.holding_repository = HoldingRepository(db)
+        self.wallet_service = WalletService(db)
+
+        self.market_provider = ProviderFactory.create()
+
+    def get_active_wallet(self):
+        """
+        Returns the active wallet.
+
+        If no wallet exists, the default Paper Wallet
+        is created automatically.
+        """
+
+        wallet = self.wallet_repository.get_active_wallet()
+
+        if wallet is not None:
+            return wallet
+
+        wallet = self.wallet_service.get_wallet()
+
+        if wallet is None:
+            raise WalletNotFoundError()
+
+        return wallet
 
     def get_portfolio(self) -> PortfolioResponse:
         """
         Returns a complete portfolio summary.
         """
 
-        wallet = self.wallet_repository.get_active_wallet()
-
-        if wallet is None:
-            raise WalletNotFoundError()
+        wallet = self.get_active_wallet()
 
         holdings = (
             self.db.query(Holding)
@@ -49,11 +70,12 @@ class PortfolioQueryService:
         )
 
         assets: list[PortfolioAssetResponse] = []
+
         holdings_value = Decimal("0.00")
 
         for holding in holdings:
 
-            current_price = PriceService.get_price(
+            current_price = self.market_provider.get_price(
                 holding.symbol
             )
 

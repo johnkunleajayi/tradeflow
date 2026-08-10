@@ -1,21 +1,24 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import ConfigDict
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     """
     Application settings.
+
+    Values are automatically loaded from
+    environment variables or a .env file.
     """
 
-    model_config = SettingsConfigDict(
+    model_config = ConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="forbid",
-        case_sensitive=True,
+        extra="ignore",
     )
 
     APP_NAME: str = "TradeFlow AI"
+
     APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True
 
     ENVIRONMENT: str = "development"
 

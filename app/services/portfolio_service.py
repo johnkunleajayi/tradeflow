@@ -14,7 +14,8 @@ from app.models.wallet import Wallet
 from app.repositories.holding_repository import HoldingRepository
 from app.repositories.trade_repository import TradeRepository
 from app.repositories.wallet_repository import WalletRepository
-from app.schemas.trade import BuyTradeResponse
+from app.schemas.trade import BuyTradeResponse, SellTradeResponse
+from app.services.wallet_service import WalletService
 
 
 class PortfolioService:
@@ -35,12 +36,22 @@ class PortfolioService:
         self.holding_repository = HoldingRepository(db)
         self.trade_repository = TradeRepository(db)
 
+        self.wallet_service = WalletService(db)
+
     def get_active_wallet(self) -> Wallet:
         """
         Returns the active wallet.
+
+        If no active wallet exists, the WalletService creates
+        the default Paper Wallet.
         """
 
         wallet = self.wallet_repository.get_active_wallet()
+
+        if wallet is not None:
+            return wallet
+
+        wallet = self.wallet_service.get_wallet()
 
         if wallet is None:
             raise WalletNotFoundError()
@@ -120,7 +131,9 @@ class PortfolioService:
         total_quantity = holding.quantity + quantity
 
         holding.average_buy_price = (
-            (holding.quantity * holding.average_buy_price)
+            (
+                holding.quantity * holding.average_buy_price
+            )
             + (quantity * price)
         ) / total_quantity
 
@@ -219,10 +232,17 @@ class PortfolioService:
         """
 
         wallet = self.get_active_wallet()
-        self.validate_cash_balance(wallet, amount)
+
+        self.validate_cash_balance(
+            wallet,
+            amount,
+        )
 
         try:
-            self.deduct_cash(wallet, amount)
+            self.deduct_cash(
+                wallet,
+                amount,
+            )
 
             self.create_or_update_holding(
                 wallet=wallet,
@@ -260,7 +280,7 @@ class PortfolioService:
         symbol: str,
         quantity: Decimal,
         price: Decimal,
-    ) -> BuyTradeResponse:
+    ) -> SellTradeResponse:
         """
         Executes a complete SELL transaction.
         """
@@ -303,7 +323,7 @@ class PortfolioService:
             self.db.refresh(wallet)
             self.db.refresh(trade)
 
-            return BuyTradeResponse(
+            return SellTradeResponse(
                 symbol=symbol.upper(),
                 amount=total_value,
                 price=price,
