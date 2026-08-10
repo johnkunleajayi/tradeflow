@@ -29,6 +29,20 @@ class HoldingRepository:
             .first()
         )
 
+    def get_all_by_wallet(
+        self,
+        wallet_id: int,
+    ) -> list[Holding]:
+        """
+        Returns all holdings belonging to a wallet.
+        """
+
+        return (
+            self.db.query(Holding)
+            .filter(Holding.wallet_id == wallet_id)
+            .all()
+        )
+
     def save(
         self,
         holding: Holding,
@@ -38,6 +52,7 @@ class HoldingRepository:
         """
 
         self.db.add(holding)
+
         return holding
 
     def delete(

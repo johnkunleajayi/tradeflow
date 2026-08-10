@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     """
     Application settings.
 
-    Values are automatically loaded from
-    environment variables or a .env file.
+    Values are automatically loaded from environment variables
+    or a .env file.
     """
 
     model_config = ConfigDict(
@@ -24,13 +24,21 @@ class Settings(BaseSettings):
 
     MARKET_PROVIDER: str = "mock"
 
-    QUIDAX_BASE_URL: str = "https://www.quidax.com/api/v1"
+    TRADING_MODE: str = "paper"
+
+    QUIDAX_BASE_URL: str = (
+        "https://openapi.quidax.io/exchange-open-api/api/v1"
+    )
 
     QUIDAX_API_KEY: str = ""
 
     QUIDAX_SECRET_KEY: str = ""
 
     REQUEST_TIMEOUT: int = 10
+
+    QUIDAX_ORDER_POLL_INTERVAL: float = 0.5
+
+    QUIDAX_ORDER_TIMEOUT: int = 15
 
 
 settings = Settings()

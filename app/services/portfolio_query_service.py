@@ -58,15 +58,16 @@ class PortfolioQueryService:
 
     def get_portfolio(self) -> PortfolioResponse:
         """
-        Returns a complete portfolio summary.
+        Returns the current portfolio summary using
+        the configured market data provider.
         """
 
         wallet = self.get_active_wallet()
 
         holdings = (
-            self.db.query(Holding)
-            .filter(Holding.wallet_id == wallet.id)
-            .all()
+            self.holding_repository.get_all_by_wallet(
+                wallet.id
+            )
         )
 
         assets: list[PortfolioAssetResponse] = []
@@ -74,7 +75,6 @@ class PortfolioQueryService:
         holdings_value = Decimal("0.00")
 
         for holding in holdings:
-
             current_price = self.market_provider.get_price(
                 holding.symbol
             )

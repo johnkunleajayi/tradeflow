@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.core.settings import settings
 from app.db.database import Base
 from app.db.dependencies import get_db
 from app.main import app
@@ -43,7 +44,14 @@ def db_session():
 def client(db_session):
     """
     Provides a FastAPI test client using the test database.
+
+    Tests always use the deterministic MockMarketProvider,
+    regardless of the MARKET_PROVIDER configured in .env.
     """
+
+    original_market_provider = settings.MARKET_PROVIDER
+
+    settings.MARKET_PROVIDER = "mock"
 
     def override_get_db():
         try:
@@ -53,7 +61,9 @@ def client(db_session):
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with TestClient(app) as test_client:
-        yield test_client
-
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        settings.MARKET_PROVIDER = original_market_provider
