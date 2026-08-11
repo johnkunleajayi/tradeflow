@@ -17,7 +17,9 @@ class TradeService:
     Handles trade-related business logic.
 
     TradeService coordinates:
+
     - Market price retrieval
+    - Pre-trade portfolio validation
     - Trade execution
     - Portfolio updates
     - Trade history
@@ -58,14 +60,35 @@ class TradeService:
         """
         Executes a BUY transaction.
 
-        The current paper implementation obtains the market
-        price from the configured MarketProvider and delegates
-        execution to the configured ExecutionProvider.
+        Flow:
+
+            1. Normalize symbol.
+            2. Validate requested amount.
+            3. Retrieve current market price.
+            4. Validate available wallet balance.
+            5. Send order to configured execution provider.
+            6. Receive actual execution details.
+            7. Record actual execution in the portfolio.
+
+        The execution provider remains authoritative for the
+        final executed quantity and price.
         """
 
         symbol = symbol.upper()
 
+        if amount <= 0:
+            raise ValueError(
+                "Buy amount must be greater than zero."
+            )
+
         price = self.market_provider.get_price(symbol)
+
+        wallet = self.portfolio_service.get_active_wallet()
+
+        self.portfolio_service.validate_cash_balance(
+            wallet,
+            amount,
+        )
 
         execution = self.execution_provider.buy(
             symbol=symbol,
@@ -88,14 +111,40 @@ class TradeService:
         """
         Executes a SELL transaction.
 
-        The current paper implementation obtains the market
-        price from the configured MarketProvider and delegates
-        execution to the configured ExecutionProvider.
+        Flow:
+
+            1. Normalize symbol.
+            2. Validate requested quantity.
+            3. Retrieve current market price.
+            4. Validate available holding.
+            5. Send order to configured execution provider.
+            6. Receive actual execution details.
+            7. Record actual execution in the portfolio.
+
+        The execution provider remains authoritative for the
+        final executed quantity and price.
         """
 
         symbol = symbol.upper()
 
+        if quantity <= 0:
+            raise ValueError(
+                "Sell quantity must be greater than zero."
+            )
+
         price = self.market_provider.get_price(symbol)
+
+        wallet = self.portfolio_service.get_active_wallet()
+
+        holding = self.portfolio_service.get_holding_for_sell(
+            wallet,
+            symbol,
+        )
+
+        self.portfolio_service.validate_holding_quantity(
+            holding,
+            quantity,
+        )
 
         execution = self.execution_provider.sell(
             symbol=symbol,

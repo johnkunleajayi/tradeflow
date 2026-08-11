@@ -15,6 +15,20 @@ class QuidaxExecutionProvider(ExecutionProvider):
     - Reading the actual execution details from Quidax.
 
     Portfolio state remains the responsibility of the trading layer.
+
+    Quidax market-order semantics:
+
+    BUY:
+        For NGN markets such as BTC/NGN, the market BUY volume
+        represents the amount of quote currency (NGN) to spend.
+
+    SELL:
+        For NGN markets such as BTC/NGN, the market SELL volume
+        represents the amount of base currency (BTC) to sell.
+
+    Therefore TradeFlow must NOT convert a BUY amount from NGN
+    into BTC before sending the Quidax order. Quidax performs
+    that conversion using the live market.
     """
 
     SUPPORTED_MARKETS = {
@@ -113,6 +127,11 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         Quidax may return the order immediately after creation,
         so the order is fetched again until it is completed.
+
+        The completed Quidax order remains authoritative for:
+        - executed quantity
+        - average execution price
+        - total execution value
         """
 
         order = self._extract_order_data(order_response)
@@ -137,6 +156,18 @@ class QuidaxExecutionProvider(ExecutionProvider):
             "avg_price",
             {},
         )
+
+        if not isinstance(executed_volume, dict):
+            raise ValueError(
+                f"Quidax order {order_id} returned invalid "
+                "executed volume data."
+            )
+
+        if not isinstance(avg_price, dict):
+            raise ValueError(
+                f"Quidax order {order_id} returned invalid "
+                "average price data."
+            )
 
         quantity = Decimal(
             str(
@@ -190,8 +221,35 @@ class QuidaxExecutionProvider(ExecutionProvider):
         """
         Places a market BUY order on Quidax.
 
-        The supplied price is only used to estimate the amount
-        of base currency to request.
+        IMPORTANT:
+
+        `amount` represents the amount of quote currency
+        (NGN) TradeFlow wants to spend.
+
+        For example:
+
+            amount = Decimal("2000")
+
+        results in a Quidax order equivalent to:
+
+            {
+                "market": "btcngn",
+                "side": "buy",
+                "ord_type": "market",
+                "volume": "2000"
+            }
+
+        We intentionally do NOT calculate:
+
+            amount / price
+
+        because Quidax's market BUY endpoint expects the
+        quote-currency amount for this market.
+
+        The supplied `price` is retained in the provider
+        interface for compatibility with the ExecutionProvider
+        contract, but it is not used to construct the Quidax
+        market BUY order.
 
         Quidax remains authoritative for the actual:
         - executed quantity
@@ -203,7 +261,10 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         market = self._get_market(symbol)
 
-        requested_quantity = amount / price
+        if amount <= 0:
+            raise ValueError(
+                "Buy amount must be greater than zero."
+            )
 
         response = self.client.post(
             "/users/me/orders",
@@ -211,7 +272,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 "market": market,
                 "side": "buy",
                 "ord_type": "market",
-                "volume": str(requested_quantity),
+                "volume": str(amount),
             },
             authenticated=True,
         )
@@ -240,7 +301,21 @@ class QuidaxExecutionProvider(ExecutionProvider):
         """
         Places a market SELL order on Quidax.
 
-        The requested quantity is sent to Quidax.
+        For a market SELL, `quantity` represents the amount
+        of base currency to sell.
+
+        Example:
+
+            quantity = Decimal("0.0001")
+
+        results in a Quidax order equivalent to:
+
+            {
+                "market": "btcngn",
+                "side": "sell",
+                "ord_type": "market",
+                "volume": "0.0001"
+            }
 
         Quidax remains authoritative for the actual:
         - executed quantity
@@ -251,6 +326,11 @@ class QuidaxExecutionProvider(ExecutionProvider):
         symbol = symbol.upper()
 
         market = self._get_market(symbol)
+
+        if quantity <= 0:
+            raise ValueError(
+                "Sell quantity must be greater than zero."
+            )
 
         response = self.client.post(
             "/users/me/orders",

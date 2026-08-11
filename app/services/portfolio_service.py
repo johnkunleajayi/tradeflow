@@ -3,10 +3,10 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
+    HoldingNotFoundError,
     InsufficientBalanceError,
     InsufficientHoldingError,
     WalletNotFoundError,
-    HoldingNotFoundError,
 )
 from app.models.holding import Holding
 from app.models.trade import Trade
@@ -20,13 +20,20 @@ from app.services.wallet_service import WalletService
 
 class PortfolioService:
     """
-    Handles portfolio state.
+    Handles local portfolio state.
 
     Responsibilities:
     - Active wallet
     - Cash balance
     - Holdings
     - Portfolio updates
+    - Trade recording
+
+    This service does NOT communicate with Quidax.
+
+    For live trading, the execution provider is responsible for
+    obtaining the actual execution details from the exchange.
+    This service then records those actual execution details.
     """
 
     def __init__(self, db: Session):
@@ -42,8 +49,8 @@ class PortfolioService:
         """
         Returns the active wallet.
 
-        If no active wallet exists, the WalletService creates
-        the default Paper Wallet.
+        If no active wallet exists, WalletService creates or
+        returns the default wallet.
         """
 
         wallet = self.wallet_repository.get_active_wallet()
@@ -67,6 +74,11 @@ class PortfolioService:
         Ensures the wallet has sufficient cash.
         """
 
+        if amount <= 0:
+            raise ValueError(
+                "Trade amount must be greater than zero."
+            )
+
         if wallet.cash_balance < amount:
             raise InsufficientBalanceError()
 
@@ -76,10 +88,19 @@ class PortfolioService:
         amount: Decimal,
     ) -> Wallet:
         """
-        Deducts cash from the wallet.
+        Deducts the actual executed cash value from the wallet.
         """
 
+        if amount <= 0:
+            raise ValueError(
+                "Cash deduction amount must be greater than zero."
+            )
+
+        if wallet.cash_balance < amount:
+            raise InsufficientBalanceError()
+
         wallet.cash_balance -= amount
+
         self.wallet_repository.save(wallet)
 
         return wallet
@@ -90,10 +111,16 @@ class PortfolioService:
         amount: Decimal,
     ) -> Wallet:
         """
-        Adds cash to the wallet.
+        Adds actual executed cash proceeds to the wallet.
         """
 
+        if amount <= 0:
+            raise ValueError(
+                "Cash addition amount must be greater than zero."
+            )
+
         wallet.cash_balance += amount
+
         self.wallet_repository.save(wallet)
 
         return wallet
@@ -106,14 +133,29 @@ class PortfolioService:
         price: Decimal,
     ) -> Holding:
         """
-        Creates a new holding or updates an existing one.
+        Creates a new holding or updates an existing holding.
+
+        The supplied quantity and price must represent the
+        ACTUAL completed execution.
         """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Holding quantity must be greater than zero."
+            )
+
+        if price <= 0:
+            raise ValueError(
+                "Holding price must be greater than zero."
+            )
 
         symbol = symbol.upper()
 
-        holding = self.holding_repository.get_by_wallet_and_symbol(
-            wallet.id,
-            symbol,
+        holding = (
+            self.holding_repository.get_by_wallet_and_symbol(
+                wallet.id,
+                symbol,
+            )
         )
 
         if holding is None:
@@ -130,12 +172,15 @@ class PortfolioService:
 
         total_quantity = holding.quantity + quantity
 
+        total_cost = (
+            holding.quantity * holding.average_buy_price
+        ) + (
+            quantity * price
+        )
+
         holding.average_buy_price = (
-            (
-                holding.quantity * holding.average_buy_price
-            )
-            + (quantity * price)
-        ) / total_quantity
+            total_cost / total_quantity
+        )
 
         holding.quantity = total_quantity
 
@@ -149,12 +194,14 @@ class PortfolioService:
         symbol: str,
     ) -> Holding:
         """
-        Gets holding required for SELL.
+        Gets the holding required for a SELL.
         """
 
-        holding = self.holding_repository.get_by_wallet_and_symbol(
-            wallet.id,
-            symbol,
+        holding = (
+            self.holding_repository.get_by_wallet_and_symbol(
+                wallet.id,
+                symbol,
+            )
         )
 
         if holding is None:
@@ -168,8 +215,13 @@ class PortfolioService:
         quantity: Decimal,
     ) -> None:
         """
-        Ensures enough asset is available.
+        Ensures enough asset is available for the requested SELL.
         """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Sell quantity must be greater than zero."
+            )
 
         if holding.quantity < quantity:
             raise InsufficientHoldingError(
@@ -182,8 +234,20 @@ class PortfolioService:
         quantity: Decimal,
     ) -> Holding | None:
         """
-        Reduces holding quantity after SELL.
+        Reduces the holding by the ACTUAL executed quantity.
+
+        If the remaining quantity is zero, the holding is deleted.
         """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Holding reduction quantity must be greater than zero."
+            )
+
+        if holding.quantity < quantity:
+            raise InsufficientHoldingError(
+                holding.symbol
+            )
 
         holding.quantity -= quantity
 
@@ -204,8 +268,18 @@ class PortfolioService:
         price: Decimal,
     ) -> Trade:
         """
-        Records a completed trade.
+        Records the ACTUAL completed exchange execution.
         """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Trade quantity must be greater than zero."
+            )
+
+        if price <= 0:
+            raise ValueError(
+                "Trade price must be greater than zero."
+            )
 
         trade = Trade(
             wallet_id=wallet.id,
@@ -228,7 +302,13 @@ class PortfolioService:
         quantity: Decimal,
     ) -> BuyTradeResponse:
         """
-        Executes a complete BUY transaction.
+        Records a completed BUY using the ACTUAL execution.
+
+        `amount`, `price`, and `quantity` should come from the
+        execution provider after Quidax confirms the order.
+
+        The local wallet is charged the actual execution value,
+        not the original estimated order value.
         """
 
         wallet = self.get_active_wallet()
@@ -282,7 +362,12 @@ class PortfolioService:
         price: Decimal,
     ) -> SellTradeResponse:
         """
-        Executes a complete SELL transaction.
+        Records a completed SELL using the ACTUAL execution.
+
+        `quantity` and `price` should come from the execution
+        provider after Quidax confirms the order.
+
+        The wallet receives the actual executed value.
         """
 
         wallet = self.get_active_wallet()
