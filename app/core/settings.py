@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from pydantic import ConfigDict
 from pydantic_settings import BaseSettings
 
@@ -17,13 +19,10 @@ class Settings(BaseSettings):
     )
 
     APP_NAME: str = "TradeFlow AI"
-
     APP_VERSION: str = "1.0.0"
-
     ENVIRONMENT: str = "development"
 
     MARKET_PROVIDER: str = "mock"
-
     TRADING_MODE: str = "paper"
 
     QUIDAX_BASE_URL: str = (
@@ -31,14 +30,16 @@ class Settings(BaseSettings):
     )
 
     QUIDAX_API_KEY: str = ""
-
     QUIDAX_SECRET_KEY: str = ""
 
     REQUEST_TIMEOUT: int = 10
 
     QUIDAX_ORDER_POLL_INTERVAL: float = 0.5
-
     QUIDAX_ORDER_TIMEOUT: int = 15
+
+    # Quidax current spot market maker/taker trading fee.
+    # Market orders are taker orders.
+    QUIDAX_TRADING_FEE_RATE: Decimal = Decimal("0.001")
 
 
 settings = Settings()

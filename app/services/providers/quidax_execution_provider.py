@@ -1,6 +1,8 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from time import monotonic, sleep
 
+from app.core.settings import settings
 from app.integrations.quidax.client import QuidaxClient
 from app.services.providers.execution_provider import ExecutionProvider
 
@@ -9,26 +11,42 @@ class QuidaxExecutionProvider(ExecutionProvider):
     """
     Live trade execution provider backed by Quidax.
 
-    This provider is responsible only for:
-    - Sending BUY and SELL orders to Quidax.
-    - Waiting for the order to reach a completed state.
-    - Reading the actual execution details from Quidax.
+    Responsibilities:
+    - Send BUY and SELL orders to Quidax.
+    - Wait for completion.
+    - Retrieve actual matched trade fills.
+    - Aggregate multiple fills.
+    - Calculate actual gross execution value.
+    - Apply the configured Quidax trading fee model.
+    - Return execution details to the portfolio layer.
 
-    Portfolio state remains the responsibility of the trading layer.
+    Portfolio state remains the responsibility of the
+    trading/portfolio layer.
+
+    Important Quidax behavior observed in production:
+
+    A completed order may return:
+
+        status = "done"
+        trades = None
+        trades_count = "0"
+
+    while the actual matched fill is available through:
+
+        GET /users/me/trades
+
+    Therefore TradeFlow MUST NOT rely on the order's
+    `trades_count` field to determine whether a fill exists.
 
     Quidax market-order semantics:
 
     BUY:
-        For NGN markets such as BTC/NGN, the market BUY volume
-        represents the amount of quote currency (NGN) to spend.
+        The market BUY volume represents the quote currency
+        amount to spend.
 
     SELL:
-        For NGN markets such as BTC/NGN, the market SELL volume
-        represents the amount of base currency (BTC) to sell.
-
-    Therefore TradeFlow must NOT convert a BUY amount from NGN
-    into BTC before sending the Quidax order. Quidax performs
-    that conversion using the live market.
+        The market SELL volume represents the base currency
+        quantity to sell.
     """
 
     SUPPORTED_MARKETS = {
@@ -39,15 +57,39 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
     TERMINAL_SUCCESS_STATUS = "done"
 
+    # Quidax trade timestamps are returned with second-level
+    # precision. Allow a small amount of tolerance around the
+    # completed order's timestamps when matching fills.
+    FILL_TIME_TOLERANCE_SECONDS = 5
+
     def __init__(
         self,
         client: QuidaxClient | None = None,
     ):
         self.client = client or QuidaxClient()
 
-    def _get_market(self, symbol: str) -> str:
+    @property
+    def fee_rate(self) -> Decimal:
         """
-        Converts a TradeFlow symbol into its Quidax market pair.
+        Current configured Quidax trading fee rate.
+
+        Example:
+
+            0.001
+
+        represents 0.10%.
+        """
+
+        return Decimal(
+            str(settings.QUIDAX_TRADING_FEE_RATE)
+        )
+
+    def _get_market(
+        self,
+        symbol: str,
+    ) -> str:
+        """
+        Converts a TradeFlow symbol into a Quidax market.
         """
 
         symbol = symbol.upper()
@@ -81,13 +123,16 @@ class QuidaxExecutionProvider(ExecutionProvider):
         order_id: str,
     ) -> dict:
         """
-        Polls Quidax until the order reaches a terminal state.
+        Polls Quidax until the order reaches a successful
+        terminal state.
 
-        Successful execution requires status='done'.
+        IMPORTANT:
 
-        If the order does not complete within the configured
-        timeout, an exception is raised rather than allowing
-        TradeFlow to record an uncertain execution.
+        A `done` status does not itself prove that TradeFlow
+        has obtained the actual execution fill.
+
+        The caller must subsequently retrieve the actual
+        matched trades.
         """
 
         started_at = monotonic()
@@ -98,7 +143,9 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 authenticated=True,
             )
 
-            order = self._extract_order_data(response)
+            order = self._extract_order_data(
+                response
+            )
 
             status = str(
                 order.get("status", "")
@@ -116,101 +163,654 @@ class QuidaxExecutionProvider(ExecutionProvider):
                     f"Order ID: {order_id}, status: {status}"
                 )
 
-            sleep(self.client.order_poll_interval)
+            sleep(
+                self.client.order_poll_interval
+            )
+
+    @staticmethod
+    def _to_decimal(
+        value: object,
+    ) -> Decimal:
+        """
+        Safely converts a Quidax numeric value to Decimal.
+        """
+
+        try:
+            return Decimal(str(value))
+        except Exception as exc:
+            raise ValueError(
+                "Invalid numeric value returned by Quidax: "
+                f"{value!r}"
+            ) from exc
+
+    @staticmethod
+    def _parse_datetime(
+        value: object,
+    ) -> datetime | None:
+        """
+        Parses a Quidax ISO timestamp.
+        """
+
+        if not value:
+            return None
+
+        try:
+            parsed = datetime.fromisoformat(
+                str(value).replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return parsed
+
+        except (TypeError, ValueError):
+            return None
+
+    def _get_order_fills(
+        self,
+        completed_order: dict,
+    ) -> list[dict]:
+        """
+        Retrieves the actual matched trade fills belonging
+        to the completed Quidax order.
+
+        Quidax may return fills directly through:
+
+            completed_order["trades"]
+
+        If those are unavailable, TradeFlow queries:
+
+            GET /users/me/trades
+
+        The observed Quidax API can return:
+
+            trades = None
+            trades_count = "0"
+
+        even when an actual fill exists.
+
+        Therefore `trades_count` is deliberately NOT used
+        as a prerequisite for querying the trades endpoint.
+        """
+
+        # ---------------------------------------------------------
+        # 1. Prefer trades embedded directly in the order.
+        # ---------------------------------------------------------
+
+        direct_trades = completed_order.get(
+            "trades"
+        )
+
+        if isinstance(
+            direct_trades,
+            list,
+        ):
+            valid_direct_trades = [
+                trade
+                for trade in direct_trades
+                if isinstance(trade, dict)
+            ]
+
+            if valid_direct_trades:
+                return valid_direct_trades
+
+        # ---------------------------------------------------------
+        # 2. Fall back to the authenticated user trades endpoint.
+        #
+        # DO NOT check trades_count here.
+        #
+        # We have verified that Quidax can return:
+        #
+        #     trades_count = "0"
+        #
+        # while /users/me/trades contains the actual fill.
+        # ---------------------------------------------------------
+
+        market_data = completed_order.get(
+            "market",
+            {}
+        )
+
+        if not isinstance(
+            market_data,
+            dict,
+        ):
+            raise RuntimeError(
+                "Quidax completed order returned invalid market data."
+            )
+
+        market = str(
+            market_data.get(
+                "id",
+                "",
+            )
+        ).lower()
+
+        if not market:
+            raise RuntimeError(
+                "Quidax completed order did not contain a valid market."
+            )
+
+        order_created_at = self._parse_datetime(
+            completed_order.get(
+                "created_at"
+            )
+        )
+
+        order_updated_at = self._parse_datetime(
+            completed_order.get(
+                "updated_at"
+            )
+        )
+
+        order_done_at = self._parse_datetime(
+            completed_order.get(
+                "done_at"
+            )
+        )
+
+        # Prefer the actual completion timestamp where available.
+        order_end_at = (
+            order_done_at
+            or order_updated_at
+            or order_created_at
+        )
+
+        response = self.client.get(
+            "/users/me/trades",
+            params={
+                "market": market,
+                "limit": 100,
+            },
+            authenticated=True,
+        )
+
+        data = response.get("data")
+
+        if not isinstance(
+            data,
+            list,
+        ):
+            raise RuntimeError(
+                "Quidax trades endpoint returned invalid trade data."
+            )
+
+        candidate_trades: list[dict] = []
+
+        for trade in data:
+            if not isinstance(
+                trade,
+                dict,
+            ):
+                continue
+
+            trade_market_data = trade.get(
+                "market",
+                {}
+            )
+
+            if not isinstance(
+                trade_market_data,
+                dict,
+            ):
+                continue
+
+            trade_market = str(
+                trade_market_data.get(
+                    "id",
+                    "",
+                )
+            ).lower()
+
+            if trade_market != market:
+                continue
+
+            trade_created_at = self._parse_datetime(
+                trade.get(
+                    "created_at"
+                )
+            )
+
+            # If Quidax does not provide a timestamp for a trade,
+            # we cannot safely associate it with the order.
+            if trade_created_at is None:
+                continue
+
+            # -----------------------------------------------------
+            # Lower boundary:
+            #
+            # Fill must not pre-date the order.
+            # -----------------------------------------------------
+
+            if order_created_at is not None:
+                lower_bound = (
+                    order_created_at
+                    - timedelta(
+                        seconds=self.FILL_TIME_TOLERANCE_SECONDS
+                    )
+                )
+
+                if trade_created_at < lower_bound:
+                    continue
+
+            # -----------------------------------------------------
+            # Upper boundary:
+            #
+            # Fill must belong to the completion window.
+            # -----------------------------------------------------
+
+            if order_end_at is not None:
+                upper_bound = (
+                    order_end_at
+                    + timedelta(
+                        seconds=self.FILL_TIME_TOLERANCE_SECONDS
+                    )
+                )
+
+                if trade_created_at > upper_bound:
+                    continue
+
+            candidate_trades.append(
+                trade
+            )
+
+        if not candidate_trades:
+            raise RuntimeError(
+                "Quidax order is marked done, but TradeFlow "
+                "could not locate a matching execution fill "
+                "through /users/me/trades. "
+                f"Market: {market}, "
+                f"Order ID: {completed_order.get('id')}"
+            )
+
+        # Quidax normally returns newest trades first.
+        # Sort explicitly so aggregation is deterministic.
+        candidate_trades.sort(
+            key=lambda trade: (
+                self._parse_datetime(
+                    trade.get("created_at")
+                )
+                or datetime.min.replace(
+                    tzinfo=timezone.utc
+                )
+            )
+        )
+
+        return candidate_trades
+
+    def _aggregate_fills(
+        self,
+        fills: list[dict],
+        symbol: str,
+    ) -> dict:
+        """
+        Aggregates one or more Quidax trade fills.
+
+        Returns:
+
+            quantity
+            total quote value
+            weighted-average execution price
+            fills
+        """
+
+        expected_market = self._get_market(
+            symbol
+        )
+
+        total_quantity = Decimal("0")
+        total_value = Decimal("0")
+
+        valid_fills: list[dict] = []
+
+        for fill in fills:
+            market = fill.get(
+                "market",
+                {}
+            )
+
+            if not isinstance(
+                market,
+                dict,
+            ):
+                continue
+
+            market_id = str(
+                market.get(
+                    "id",
+                    "",
+                )
+            ).lower()
+
+            if market_id != expected_market:
+                continue
+
+            price_data = fill.get(
+                "price",
+                {}
+            )
+
+            volume_data = fill.get(
+                "volume",
+                {}
+            )
+
+            total_data = fill.get(
+                "total",
+                {}
+            )
+
+            if not isinstance(
+                price_data,
+                dict,
+            ):
+                continue
+
+            if not isinstance(
+                volume_data,
+                dict,
+            ):
+                continue
+
+            if not isinstance(
+                total_data,
+                dict,
+            ):
+                continue
+
+            price = self._to_decimal(
+                price_data.get(
+                    "amount",
+                    "0",
+                )
+            )
+
+            quantity = self._to_decimal(
+                volume_data.get(
+                    "amount",
+                    "0",
+                )
+            )
+
+            total = self._to_decimal(
+                total_data.get(
+                    "amount",
+                    "0",
+                )
+            )
+
+            if price <= 0:
+                continue
+
+            if quantity <= 0:
+                continue
+
+            if total <= 0:
+                continue
+
+            total_quantity += quantity
+            total_value += total
+
+            valid_fills.append(
+                fill
+            )
+
+        if not valid_fills:
+            raise RuntimeError(
+                f"Quidax returned no valid {symbol} "
+                "trade fills for the completed order."
+            )
+
+        if total_quantity <= 0:
+            raise RuntimeError(
+                "Quidax fills produced zero executed quantity."
+            )
+
+        if total_value <= 0:
+            raise RuntimeError(
+                "Quidax fills produced zero execution value."
+            )
+
+        average_price = (
+            total_value / total_quantity
+        )
+
+        return {
+            "quantity": total_quantity,
+            "amount": total_value,
+            "price": average_price,
+            "fills": valid_fills,
+        }
 
     def _get_actual_execution(
         self,
         order_response: dict,
+        side: str,
+        symbol: str,
     ) -> dict:
         """
         Resolves the actual completed execution from Quidax.
 
-        Quidax may return the order immediately after creation,
-        so the order is fetched again until it is completed.
+        The actual trade fills are authoritative for:
 
-        The completed Quidax order remains authoritative for:
         - executed quantity
-        - average execution price
-        - total execution value
+        - execution price
+        - gross execution value
+
+        The configured fee model is then applied.
+
+        SELL:
+            Fee is deducted from quote-currency proceeds.
+
+        BUY:
+            Fee is deducted from the acquired base asset.
         """
 
-        order = self._extract_order_data(order_response)
+        order = self._extract_order_data(
+            order_response
+        )
 
-        order_id = order.get("id")
+        order_id = order.get(
+            "id"
+        )
 
         if not order_id:
             raise ValueError(
-                "Quidax order response did not contain an order ID."
+                "Quidax order response did not contain "
+                "an order ID."
             )
 
         completed_order = self._wait_for_order(
             str(order_id)
         )
 
-        executed_volume = completed_order.get(
-            "executed_volume",
-            {},
+        fills = self._get_order_fills(
+            completed_order
         )
 
-        avg_price = completed_order.get(
-            "avg_price",
-            {},
+        execution = self._aggregate_fills(
+            fills=fills,
+            symbol=symbol,
         )
 
-        if not isinstance(executed_volume, dict):
+        gross_quantity = execution[
+            "quantity"
+        ]
+
+        gross_amount = execution[
+            "amount"
+        ]
+
+        price = execution[
+            "price"
+        ]
+
+        side = side.upper()
+
+        market_data = completed_order.get(
+            "market",
+            {}
+        )
+
+        if not isinstance(
+            market_data,
+            dict,
+        ):
+            market_data = {}
+
+        base_currency = str(
+            market_data.get(
+                "base_unit",
+                symbol,
+            )
+        ).upper()
+
+        quote_currency = str(
+            market_data.get(
+                "quote_unit",
+                "NGN",
+            )
+        ).upper()
+
+        fee_rate = self.fee_rate
+
+        if fee_rate < 0:
             raise ValueError(
-                f"Quidax order {order_id} returned invalid "
-                "executed volume data."
+                "Quidax trading fee rate cannot be negative."
             )
 
-        if not isinstance(avg_price, dict):
-            raise ValueError(
-                f"Quidax order {order_id} returned invalid "
-                "average price data."
+        # ---------------------------------------------------------
+        # SELL
+        # ---------------------------------------------------------
+
+        if side == "SELL":
+
+            # Example from your verified Quidax transaction:
+            #
+            # Quantity:
+            #     0.000015 BTC
+            #
+            # Price:
+            #     88,727,534 NGN
+            #
+            # Gross:
+            #     1,330.91301 NGN
+            #
+            # Fee:
+            #     1.33091301 NGN
+            #
+            # Net:
+            #     1,329.58209699 NGN
+
+            fee = (
+                gross_amount
+                * fee_rate
             )
 
-        quantity = Decimal(
-            str(
-                executed_volume.get(
-                    "amount",
-                    "0",
+            net_amount = (
+                gross_amount
+                - fee
+            )
+
+            if net_amount <= 0:
+                raise ValueError(
+                    f"Quidax order {order_id} produced "
+                    "non-positive net proceeds."
                 )
-            )
-        )
 
-        price = Decimal(
-            str(
-                avg_price.get(
-                    "amount",
-                    "0",
+            return {
+                "order_id": str(
+                    order_id
+                ),
+                "status": str(
+                    completed_order.get(
+                        "status",
+                        "",
+                    )
+                ),
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "quantity": gross_quantity,
+                "gross_quantity": gross_quantity,
+                "price": price,
+                "amount": net_amount,
+                "gross_amount": gross_amount,
+                "net_amount": net_amount,
+                "fee": fee,
+                "fee_currency": quote_currency,
+                "fee_rate": fee_rate,
+                "fills": execution[
+                    "fills"
+                ],
+                "order": completed_order,
+            }
+
+        # ---------------------------------------------------------
+        # BUY
+        # ---------------------------------------------------------
+
+        if side == "BUY":
+
+            # Gross cryptocurrency received from the actual
+            # matched fills.
+            #
+            # Fee is charged against the acquired base asset.
+            #
+            # The quote amount remains the actual gross cash
+            # value of the matched trade.
+
+            fee = (
+                gross_quantity
+                * fee_rate
+            )
+
+            net_quantity = (
+                gross_quantity
+                - fee
+            )
+
+            if net_quantity <= 0:
+                raise ValueError(
+                    f"Quidax order {order_id} produced "
+                    "non-positive net quantity."
                 )
-            )
+
+            return {
+                "order_id": str(
+                    order_id
+                ),
+                "status": str(
+                    completed_order.get(
+                        "status",
+                        "",
+                    )
+                ),
+                "symbol": symbol.upper(),
+                "side": "BUY",
+                "quantity": net_quantity,
+                "gross_quantity": gross_quantity,
+                "price": price,
+                "amount": gross_amount,
+                "gross_amount": gross_amount,
+                "net_amount": gross_amount,
+                "fee": fee,
+                "fee_currency": base_currency,
+                "fee_rate": fee_rate,
+                "fills": execution[
+                    "fills"
+                ],
+                "order": completed_order,
+            }
+
+        raise ValueError(
+            f"Unsupported execution side: {side}"
         )
-
-        if quantity <= 0:
-            raise ValueError(
-                f"Quidax order {order_id} completed without "
-                "an executed volume."
-            )
-
-        if price <= 0:
-            raise ValueError(
-                f"Quidax order {order_id} completed without "
-                "a valid average execution price."
-            )
-
-        amount = quantity * price
-
-        return {
-            "order_id": str(order_id),
-            "status": str(
-                completed_order.get("status", "")
-            ),
-            "quantity": quantity,
-            "price": price,
-            "amount": amount,
-            "order": completed_order,
-        }
 
     def buy(
         self,
@@ -221,45 +821,18 @@ class QuidaxExecutionProvider(ExecutionProvider):
         """
         Places a market BUY order on Quidax.
 
-        IMPORTANT:
+        `amount` represents the quote-currency amount
+        TradeFlow wants to spend.
 
-        `amount` represents the amount of quote currency
-        (NGN) TradeFlow wants to spend.
-
-        For example:
-
-            amount = Decimal("2000")
-
-        results in a Quidax order equivalent to:
-
-            {
-                "market": "btcngn",
-                "side": "buy",
-                "ord_type": "market",
-                "volume": "2000"
-            }
-
-        We intentionally do NOT calculate:
-
-            amount / price
-
-        because Quidax's market BUY endpoint expects the
-        quote-currency amount for this market.
-
-        The supplied `price` is retained in the provider
-        interface for compatibility with the ExecutionProvider
-        contract, but it is not used to construct the Quidax
-        market BUY order.
-
-        Quidax remains authoritative for the actual:
-        - executed quantity
-        - average execution price
-        - total execution value
+        Quidax remains authoritative for the actual
+        cryptocurrency quantity received.
         """
 
         symbol = symbol.upper()
 
-        market = self._get_market(symbol)
+        market = self._get_market(
+            symbol
+        )
 
         if amount <= 0:
             raise ValueError(
@@ -278,18 +851,53 @@ class QuidaxExecutionProvider(ExecutionProvider):
         )
 
         execution = self._get_actual_execution(
-            response
+            response,
+            side="BUY",
+            symbol=symbol,
         )
 
         return {
             "symbol": symbol,
             "side": "BUY",
-            "amount": execution["amount"],
-            "price": execution["price"],
-            "quantity": execution["quantity"],
-            "order_id": execution["order_id"],
-            "status": execution["status"],
-            "response": execution["order"],
+            "amount": execution[
+                "amount"
+            ],
+            "gross_amount": execution[
+                "gross_amount"
+            ],
+            "net_amount": execution[
+                "net_amount"
+            ],
+            "price": execution[
+                "price"
+            ],
+            "quantity": execution[
+                "quantity"
+            ],
+            "gross_quantity": execution[
+                "gross_quantity"
+            ],
+            "fee": execution[
+                "fee"
+            ],
+            "fee_currency": execution[
+                "fee_currency"
+            ],
+            "fee_rate": execution[
+                "fee_rate"
+            ],
+            "order_id": execution[
+                "order_id"
+            ],
+            "status": execution[
+                "status"
+            ],
+            "fills": execution[
+                "fills"
+            ],
+            "response": execution[
+                "order"
+            ],
         }
 
     def sell(
@@ -301,31 +909,18 @@ class QuidaxExecutionProvider(ExecutionProvider):
         """
         Places a market SELL order on Quidax.
 
-        For a market SELL, `quantity` represents the amount
-        of base currency to sell.
+        `quantity` represents the base cryptocurrency
+        quantity to sell.
 
-        Example:
-
-            quantity = Decimal("0.0001")
-
-        results in a Quidax order equivalent to:
-
-            {
-                "market": "btcngn",
-                "side": "sell",
-                "ord_type": "market",
-                "volume": "0.0001"
-            }
-
-        Quidax remains authoritative for the actual:
-        - executed quantity
-        - average execution price
-        - total execution value
+        Quidax remains authoritative for the actual
+        executed quantity and gross proceeds.
         """
 
         symbol = symbol.upper()
 
-        market = self._get_market(symbol)
+        market = self._get_market(
+            symbol
+        )
 
         if quantity <= 0:
             raise ValueError(
@@ -344,16 +939,51 @@ class QuidaxExecutionProvider(ExecutionProvider):
         )
 
         execution = self._get_actual_execution(
-            response
+            response,
+            side="SELL",
+            symbol=symbol,
         )
 
         return {
             "symbol": symbol,
             "side": "SELL",
-            "amount": execution["amount"],
-            "price": execution["price"],
-            "quantity": execution["quantity"],
-            "order_id": execution["order_id"],
-            "status": execution["status"],
-            "response": execution["order"],
+            "amount": execution[
+                "amount"
+            ],
+            "gross_amount": execution[
+                "gross_amount"
+            ],
+            "net_amount": execution[
+                "net_amount"
+            ],
+            "price": execution[
+                "price"
+            ],
+            "quantity": execution[
+                "quantity"
+            ],
+            "gross_quantity": execution[
+                "gross_quantity"
+            ],
+            "fee": execution[
+                "fee"
+            ],
+            "fee_currency": execution[
+                "fee_currency"
+            ],
+            "fee_rate": execution[
+                "fee_rate"
+            ],
+            "order_id": execution[
+                "order_id"
+            ],
+            "status": execution[
+                "status"
+            ],
+            "fills": execution[
+                "fills"
+            ],
+            "response": execution[
+                "order"
+            ],
         }

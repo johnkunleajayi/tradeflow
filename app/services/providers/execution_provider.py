@@ -27,7 +27,7 @@ class ExecutionProvider(ABC):
         Executes a BUY order.
 
         Returns execution information required by
-        the trading layer.
+        the trading layer, including fee information.
         """
         raise NotImplementedError
 
@@ -42,6 +42,6 @@ class ExecutionProvider(ABC):
         Executes a SELL order.
 
         Returns execution information required by
-        the trading layer.
+        the trading layer, including fee information.
         """
         raise NotImplementedError

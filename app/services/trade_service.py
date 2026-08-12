@@ -16,24 +16,19 @@ class TradeService:
     """
     Handles trade-related business logic.
 
-    TradeService coordinates:
+    TradeFlow separates:
 
-    - Market price retrieval
-    - Pre-trade portfolio validation
-    - Trade execution
-    - Portfolio updates
-    - Trade history
+        MarketProvider
+            ↓
+        current market information
 
-    Market data and trade execution are deliberately separated.
+        ExecutionProvider
+            ↓
+        actual exchange execution
 
-    MarketProvider answers:
-        "What is the current market price?"
-
-    ExecutionProvider answers:
-        "How should this trade be executed?"
-
-    PortfolioService answers:
-        "How should the local portfolio state be updated?"
+        PortfolioService
+            ↓
+        local wallet / holdings / trade records
     """
 
     def __init__(self, db: Session):
@@ -63,15 +58,27 @@ class TradeService:
         Flow:
 
             1. Normalize symbol.
-            2. Validate requested amount.
-            3. Retrieve current market price.
-            4. Validate available wallet balance.
-            5. Send order to configured execution provider.
+            2. Validate amount.
+            3. Get current market price.
+            4. Validate wallet balance.
+            5. Execute through provider.
             6. Receive actual execution details.
-            7. Record actual execution in the portfolio.
+            7. Persist actual execution + fee.
 
-        The execution provider remains authoritative for the
-        final executed quantity and price.
+        Important:
+
+        The market price is used only as pre-trade market
+        information and for compatibility with the execution
+        provider interface.
+
+        The execution provider remains authoritative for:
+
+            - executed quantity
+            - executed price
+            - actual amount
+            - fee
+            - fee currency
+            - net amount
         """
 
         symbol = symbol.upper()
@@ -81,10 +88,13 @@ class TradeService:
                 "Buy amount must be greater than zero."
             )
 
+        # Obtain current market information before execution.
         price = self.market_provider.get_price(symbol)
 
         wallet = self.portfolio_service.get_active_wallet()
 
+        # Validate the requested maximum cash exposure
+        # before sending the order to the exchange.
         self.portfolio_service.validate_cash_balance(
             wallet,
             amount,
@@ -101,6 +111,22 @@ class TradeService:
             amount=execution["amount"],
             price=execution["price"],
             quantity=execution["quantity"],
+            gross_quantity=execution.get(
+                "gross_quantity",
+                execution["quantity"],
+            ),
+            fee=execution.get(
+                "fee",
+                Decimal("0"),
+            ),
+            fee_currency=execution.get(
+                "fee_currency",
+                "NGN",
+            ),
+            net_value=execution.get(
+                "net_amount",
+                execution["amount"],
+            ),
         )
 
     def sell(
@@ -114,15 +140,26 @@ class TradeService:
         Flow:
 
             1. Normalize symbol.
-            2. Validate requested quantity.
-            3. Retrieve current market price.
-            4. Validate available holding.
-            5. Send order to configured execution provider.
+            2. Validate quantity.
+            3. Get current market price.
+            4. Validate holding.
+            5. Execute through provider.
             6. Receive actual execution details.
-            7. Record actual execution in the portfolio.
+            7. Persist actual execution + fee.
 
-        The execution provider remains authoritative for the
-        final executed quantity and price.
+        Important:
+
+        The requested quantity is the maximum quantity the user
+        intends to sell.
+
+        The execution provider remains authoritative for:
+
+            - actual executed quantity
+            - executed price
+            - gross proceeds
+            - fee
+            - fee currency
+            - net proceeds
         """
 
         symbol = symbol.upper()
@@ -132,6 +169,7 @@ class TradeService:
                 "Sell quantity must be greater than zero."
             )
 
+        # Obtain current market information before execution.
         price = self.market_provider.get_price(symbol)
 
         wallet = self.portfolio_service.get_active_wallet()
@@ -141,6 +179,8 @@ class TradeService:
             symbol,
         )
 
+        # Validate the requested quantity before sending
+        # the order to Quidax.
         self.portfolio_service.validate_holding_quantity(
             holding,
             quantity,
@@ -156,4 +196,20 @@ class TradeService:
             symbol=execution["symbol"],
             quantity=execution["quantity"],
             price=execution["price"],
+            gross_amount=execution.get(
+                "gross_amount",
+                execution["amount"],
+            ),
+            fee=execution.get(
+                "fee",
+                Decimal("0"),
+            ),
+            fee_currency=execution.get(
+                "fee_currency",
+                "NGN",
+            ),
+            net_amount=execution.get(
+                "net_amount",
+                execution["amount"],
+            ),
         )
