@@ -25,7 +25,7 @@ def get_trades(
     db: Session = Depends(get_db),
 ):
     """
-    Returns all executed trades.
+    Returns all recorded trades.
     """
 
     service = TradeService(db)
@@ -42,7 +42,14 @@ def buy_trade(
     db: Session = Depends(get_db),
 ):
     """
-    Executes a paper BUY trade.
+    Executes a BUY trade using the execution provider
+    configured by TRADING_MODE.
+
+    PAPER mode:
+        Executes against the TradeFlow paper execution provider.
+
+    LIVE mode:
+        Executes a real market BUY order through Quidax.
     """
 
     service = TradeService(db)
@@ -62,7 +69,14 @@ def sell_trade(
     db: Session = Depends(get_db),
 ):
     """
-    Executes a paper SELL trade.
+    Executes a SELL trade using the execution provider
+    configured by TRADING_MODE.
+
+    PAPER mode:
+        Executes against the TradeFlow paper execution provider.
+
+    LIVE mode:
+        Executes a real market SELL order through Quidax.
     """
 
     service = TradeService(db)

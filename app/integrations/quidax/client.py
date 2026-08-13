@@ -19,6 +19,7 @@ class QuidaxClient:
     - Handle GET requests
     - Handle POST requests
     - Return decoded JSON responses
+    - Preserve Quidax API error details
     """
 
     def __init__(
@@ -72,6 +73,10 @@ class QuidaxClient:
     ) -> dict:
         """
         Executes an HTTP request against the Quidax API.
+
+        When Quidax returns an HTTP error, the response body is
+        included in the raised exception so that API-level error
+        details are not lost.
         """
 
         headers = (
@@ -92,7 +97,20 @@ class QuidaxClient:
             timeout=self.timeout,
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = response.text
+
+            raise requests.HTTPError(
+                (
+                    f"{response.status_code} "
+                    f"Client Error for url: {response.url}\n"
+                    f"Quidax response: {error_body}"
+                ),
+                response=response,
+            )
 
         return response.json()
 

@@ -1,10 +1,13 @@
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from time import monotonic, sleep
 
 from app.core.settings import settings
 from app.integrations.quidax.client import QuidaxClient
 from app.services.providers.execution_provider import ExecutionProvider
+from app.services.providers.quidax_market_provider import (
+    QuidaxMarketProvider,
+)
 
 
 class QuidaxExecutionProvider(ExecutionProvider):
@@ -12,8 +15,12 @@ class QuidaxExecutionProvider(ExecutionProvider):
     Live trade execution provider backed by Quidax.
 
     Responsibilities:
+
     - Send BUY and SELL orders to Quidax.
-    - Wait for completion.
+    - Validate Quidax market trading rules.
+    - Normalize order quantities and amounts to Quidax precision.
+    - Serialize order values without unnecessary trailing decimals.
+    - Wait for order completion.
     - Retrieve actual matched trade fills.
     - Aggregate multiple fills.
     - Calculate actual gross execution value.
@@ -23,7 +30,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
     Portfolio state remains the responsibility of the
     trading/portfolio layer.
 
-    Important Quidax behavior observed in production:
+    Important Quidax behavior:
 
     A completed order may return:
 
@@ -47,6 +54,19 @@ class QuidaxExecutionProvider(ExecutionProvider):
     SELL:
         The market SELL volume represents the base currency
         quantity to sell.
+
+    Quidax trading rules:
+
+    BUY:
+        The quote amount is normalized to quote_precision.
+        The amount must satisfy minimum_order_size.
+
+    SELL:
+        The base quantity is normalized DOWN to base_precision.
+        The estimated quote value must satisfy minimum_order_size.
+
+    Precision is obtained dynamically from Quidax rather than
+    being hard-coded for BTC, ETH, or SOL.
     """
 
     SUPPORTED_MARKETS = {
@@ -67,6 +87,11 @@ class QuidaxExecutionProvider(ExecutionProvider):
         client: QuidaxClient | None = None,
     ):
         self.client = client or QuidaxClient()
+
+        # Reuse the same Quidax client for market trading rules.
+        self.market_provider = QuidaxMarketProvider(
+            client=self.client
+        )
 
     @property
     def fee_rate(self) -> Decimal:
@@ -101,6 +126,233 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 f"Unsupported trading symbol: {symbol}"
             ) from exc
 
+    def _get_market_rules(
+        self,
+        symbol: str,
+    ) -> dict:
+        """
+        Returns the current Quidax trading rules for a symbol.
+
+        Rules include:
+
+            base_precision
+            quote_precision
+            price_precision
+            minimum_order_size
+        """
+
+        return self.market_provider.get_market_rules(
+            symbol
+        )
+
+    @staticmethod
+    def _quantize_down(
+        value: Decimal,
+        precision: int,
+    ) -> Decimal:
+        """
+        Quantizes a Decimal DOWN to the requested number of
+        decimal places.
+
+        ROUND_DOWN is intentional.
+
+        For SELL orders, TradeFlow must never increase the
+        quantity supplied by the user.
+
+        Example:
+
+            0.0000201743 with precision 8
+
+        becomes:
+
+            0.00002017
+        """
+
+        if precision < 0:
+            raise ValueError(
+                "Precision cannot be negative."
+            )
+
+        quantum = Decimal("1").scaleb(-precision)
+
+        return value.quantize(
+            quantum,
+            rounding=ROUND_DOWN,
+        )
+
+    @staticmethod
+    def _format_order_value(
+        value: Decimal,
+    ) -> str:
+        """
+        Converts a normalized Decimal into an exchange-safe
+        decimal string.
+
+        This is important because Quidax validates the number
+        of decimal places submitted in the request.
+
+        Examples:
+
+            Decimal("10000.00")
+                -> "10000"
+
+            Decimal("0.000020170000")
+                -> "0.00002017"
+
+            Decimal("100.50")
+                -> "100.5"
+
+        Scientific notation is deliberately avoided.
+        """
+
+        formatted = format(
+            value,
+            "f",
+        )
+
+        if "." in formatted:
+            formatted = formatted.rstrip("0").rstrip(".")
+
+        if formatted in {
+            "",
+            "-0",
+        }:
+            return "0"
+
+        return formatted
+
+    def _normalize_buy_amount(
+        self,
+        symbol: str,
+        amount: Decimal,
+    ) -> Decimal:
+        """
+        Normalizes a BUY quote-currency amount according to
+        Quidax quote precision.
+
+        Also validates Quidax's minimum order size.
+        """
+
+        if amount <= 0:
+            raise ValueError(
+                "Buy amount must be greater than zero."
+            )
+
+        rules = self._get_market_rules(symbol)
+
+        quote_precision = int(
+            rules.get(
+                "quote_precision",
+                2,
+            )
+        )
+
+        minimum_order_size = Decimal(
+            str(
+                rules.get(
+                    "minimum_order_size",
+                    "0",
+                )
+            )
+        )
+
+        normalized_amount = self._quantize_down(
+            amount,
+            quote_precision,
+        )
+
+        if normalized_amount <= 0:
+            raise ValueError(
+                f"BUY amount for {symbol} becomes zero after "
+                f"normalizing to {quote_precision} decimal places."
+            )
+
+        if (
+            minimum_order_size > 0
+            and normalized_amount < minimum_order_size
+        ):
+            raise ValueError(
+                f"BUY amount for {symbol} must be at least "
+                f"{minimum_order_size} NGN according to Quidax. "
+                f"Requested amount after precision normalization: "
+                f"{normalized_amount}"
+            )
+
+        return normalized_amount
+
+    def _normalize_sell_quantity(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        price: Decimal,
+    ) -> Decimal:
+        """
+        Normalizes a SELL base-asset quantity according to
+        Quidax base precision.
+
+        Also validates the estimated quote value against
+        Quidax's minimum order size.
+
+        The quantity is always rounded DOWN so TradeFlow
+        never submits more than the requested quantity.
+        """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Sell quantity must be greater than zero."
+            )
+
+        if price <= 0:
+            raise ValueError(
+                "Sell price must be greater than zero."
+            )
+
+        rules = self._get_market_rules(symbol)
+
+        base_precision = int(
+            rules.get(
+                "base_precision",
+                8,
+            )
+        )
+
+        minimum_order_size = Decimal(
+            str(
+                rules.get(
+                    "minimum_order_size",
+                    "0",
+                )
+            )
+        )
+
+        normalized_quantity = self._quantize_down(
+            quantity,
+            base_precision,
+        )
+
+        if normalized_quantity <= 0:
+            raise ValueError(
+                f"SELL quantity for {symbol} becomes zero after "
+                f"normalizing to {base_precision} decimal places."
+            )
+
+        estimated_quote_value = (
+            normalized_quantity * price
+        )
+
+        if (
+            minimum_order_size > 0
+            and estimated_quote_value < minimum_order_size
+        ):
+            raise ValueError(
+                f"SELL order for {symbol} is below Quidax's "
+                f"minimum order value of {minimum_order_size} NGN. "
+                f"Estimated order value: "
+                f"{estimated_quote_value}"
+            )
+
+        return normalized_quantity
+
     def _extract_order_data(
         self,
         response: dict,
@@ -126,12 +378,10 @@ class QuidaxExecutionProvider(ExecutionProvider):
         Polls Quidax until the order reaches a successful
         terminal state.
 
-        IMPORTANT:
-
         A `done` status does not itself prove that TradeFlow
         has obtained the actual execution fill.
 
-        The caller must subsequently retrieve the actual
+        The caller subsequently retrieves the actual
         matched trades.
         """
 
@@ -228,15 +478,8 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
             GET /users/me/trades
 
-        The observed Quidax API can return:
-
-            trades = None
-            trades_count = "0"
-
-        even when an actual fill exists.
-
-        Therefore `trades_count` is deliberately NOT used
-        as a prerequisite for querying the trades endpoint.
+        `trades_count` is deliberately NOT used as a prerequisite
+        for querying the trades endpoint.
         """
 
         # ---------------------------------------------------------
@@ -262,19 +505,11 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         # ---------------------------------------------------------
         # 2. Fall back to the authenticated user trades endpoint.
-        #
-        # DO NOT check trades_count here.
-        #
-        # We have verified that Quidax can return:
-        #
-        #     trades_count = "0"
-        #
-        # while /users/me/trades contains the actual fill.
         # ---------------------------------------------------------
 
         market_data = completed_order.get(
             "market",
-            {}
+            {},
         )
 
         if not isinstance(
@@ -294,7 +529,8 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         if not market:
             raise RuntimeError(
-                "Quidax completed order did not contain a valid market."
+                "Quidax completed order did not contain "
+                "a valid market."
             )
 
         order_created_at = self._parse_datetime(
@@ -315,7 +551,6 @@ class QuidaxExecutionProvider(ExecutionProvider):
             )
         )
 
-        # Prefer the actual completion timestamp where available.
         order_end_at = (
             order_done_at
             or order_updated_at
@@ -352,7 +587,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
             trade_market_data = trade.get(
                 "market",
-                {}
+                {},
             )
 
             if not isinstance(
@@ -377,16 +612,8 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 )
             )
 
-            # If Quidax does not provide a timestamp for a trade,
-            # we cannot safely associate it with the order.
             if trade_created_at is None:
                 continue
-
-            # -----------------------------------------------------
-            # Lower boundary:
-            #
-            # Fill must not pre-date the order.
-            # -----------------------------------------------------
 
             if order_created_at is not None:
                 lower_bound = (
@@ -398,12 +625,6 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
                 if trade_created_at < lower_bound:
                     continue
-
-            # -----------------------------------------------------
-            # Upper boundary:
-            #
-            # Fill must belong to the completion window.
-            # -----------------------------------------------------
 
             if order_end_at is not None:
                 upper_bound = (
@@ -429,8 +650,6 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 f"Order ID: {completed_order.get('id')}"
             )
 
-        # Quidax normally returns newest trades first.
-        # Sort explicitly so aggregation is deterministic.
         candidate_trades.sort(
             key=lambda trade: (
                 self._parse_datetime(
@@ -472,7 +691,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
         for fill in fills:
             market = fill.get(
                 "market",
-                {}
+                {},
             )
 
             if not isinstance(
@@ -493,17 +712,17 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
             price_data = fill.get(
                 "price",
-                {}
+                {},
             )
 
             volume_data = fill.get(
                 "volume",
-                {}
+                {},
             )
 
             total_data = fill.get(
                 "total",
-                {}
+                {},
             )
 
             if not isinstance(
@@ -597,7 +816,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
         """
         Resolves the actual completed execution from Quidax.
 
-        The actual trade fills are authoritative for:
+        Actual trade fills are authoritative for:
 
         - executed quantity
         - execution price
@@ -655,7 +874,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         market_data = completed_order.get(
             "market",
-            {}
+            {},
         )
 
         if not isinstance(
@@ -690,23 +909,6 @@ class QuidaxExecutionProvider(ExecutionProvider):
         # ---------------------------------------------------------
 
         if side == "SELL":
-
-            # Example from your verified Quidax transaction:
-            #
-            # Quantity:
-            #     0.000015 BTC
-            #
-            # Price:
-            #     88,727,534 NGN
-            #
-            # Gross:
-            #     1,330.91301 NGN
-            #
-            # Fee:
-            #     1.33091301 NGN
-            #
-            # Net:
-            #     1,329.58209699 NGN
 
             fee = (
                 gross_amount
@@ -757,8 +959,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         if side == "BUY":
 
-            # Gross cryptocurrency received from the actual
-            # matched fills.
+            # Gross cryptocurrency received from actual fills.
             #
             # Fee is charged against the acquired base asset.
             #
@@ -824,20 +1025,68 @@ class QuidaxExecutionProvider(ExecutionProvider):
         `amount` represents the quote-currency amount
         TradeFlow wants to spend.
 
+        The amount is normalized according to the current
+        Quidax quote precision and minimum order size.
+
         Quidax remains authoritative for the actual
         cryptocurrency quantity received.
+
+        IMPORTANT:
+
+        Market BUY orders do not send `price`.
+        Quidax requires `volume` for the market order.
         """
 
         symbol = symbol.upper()
-
-        market = self._get_market(
-            symbol
-        )
 
         if amount <= 0:
             raise ValueError(
                 "Buy amount must be greater than zero."
             )
+
+        if price <= 0:
+            raise ValueError(
+                "Buy price must be greater than zero."
+            )
+
+        # Quidax is authoritative for current market rules.
+        normalized_amount = (
+            self._normalize_buy_amount(
+                symbol=symbol,
+                amount=amount,
+            )
+        )
+
+        market = self._get_market(
+            symbol
+        )
+
+        # IMPORTANT:
+        #
+        # Do not send:
+        #
+        #     str(normalized_amount)
+        #
+        # directly.
+        #
+        # A Decimal such as:
+        #
+        #     Decimal("10000.00")
+        #
+        # can otherwise become:
+        #
+        #     "10000.00"
+        #
+        # when Quidax expects:
+        #
+        #     "10000"
+        #
+        # The numeric value is the same, but the decimal
+        # representation can violate Quidax's precision rule.
+
+        order_volume = self._format_order_value(
+            normalized_amount
+        )
 
         response = self.client.post(
             "/users/me/orders",
@@ -845,7 +1094,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 "market": market,
                 "side": "buy",
                 "ord_type": "market",
-                "volume": str(amount),
+                "volume": order_volume,
             },
             authenticated=True,
         )
@@ -910,7 +1159,10 @@ class QuidaxExecutionProvider(ExecutionProvider):
         Places a market SELL order on Quidax.
 
         `quantity` represents the base cryptocurrency
-        quantity to sell.
+        quantity TradeFlow wants to sell.
+
+        The quantity is normalized DOWN according to the
+        current Quidax base precision.
 
         Quidax remains authoritative for the actual
         executed quantity and gross proceeds.
@@ -918,14 +1170,31 @@ class QuidaxExecutionProvider(ExecutionProvider):
 
         symbol = symbol.upper()
 
-        market = self._get_market(
-            symbol
-        )
-
         if quantity <= 0:
             raise ValueError(
                 "Sell quantity must be greater than zero."
             )
+
+        if price <= 0:
+            raise ValueError(
+                "Sell price must be greater than zero."
+            )
+
+        normalized_quantity = (
+            self._normalize_sell_quantity(
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+            )
+        )
+
+        market = self._get_market(
+            symbol
+        )
+
+        order_volume = self._format_order_value(
+            normalized_quantity
+        )
 
         response = self.client.post(
             "/users/me/orders",
@@ -933,7 +1202,7 @@ class QuidaxExecutionProvider(ExecutionProvider):
                 "market": market,
                 "side": "sell",
                 "ord_type": "market",
-                "volume": str(quantity),
+                "volume": order_volume,
             },
             authenticated=True,
         )
