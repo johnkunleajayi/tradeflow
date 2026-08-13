@@ -22,6 +22,8 @@ class AutomationRuleResponse(BaseModel):
 
     price_step: Decimal
 
+    reference_price: Decimal | None
+
     is_active: bool
 
     created_at: datetime

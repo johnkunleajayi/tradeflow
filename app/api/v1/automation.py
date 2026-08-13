@@ -70,6 +70,9 @@ def start_automation(
 ):
     """
     Activates automation for a symbol.
+
+    If the rule has no reference price, the current
+    market price becomes the initial reference.
     """
 
     service = AutomationService(db)
@@ -86,12 +89,34 @@ def stop_automation(
     db: Session = Depends(get_db),
 ):
     """
-    Stops automation for a symbol.
+    Stops automation while preserving the reference price.
     """
 
     service = AutomationService(db)
 
     return service.deactivate(symbol)
+
+
+@router.post(
+    "/rules/{symbol}/reset",
+    response_model=AutomationRuleResponse,
+)
+def reset_automation(
+    symbol: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Resets automation to a clean inactive state.
+
+    This clears the persisted reference price and ensures
+    automation is inactive.
+
+    The configured price_step is preserved.
+    """
+
+    service = AutomationService(db)
+
+    return service.reset(symbol)
 
 
 @router.get(

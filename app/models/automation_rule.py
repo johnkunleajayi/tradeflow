@@ -25,16 +25,27 @@ class AutomationRule(Base):
     # Price movement required to trigger a trade.
     #
     # Example:
+    #
     #     100000
     #
     # BUY:
-    #     price drops by 100,000 NGN
+    #     reference price - 100000
     #
     # SELL:
-    #     price rises by 100,000 NGN
+    #     reference price + 100000
     price_step: Mapped[Decimal] = mapped_column(
         Numeric(32, 8),
         nullable=False,
+    )
+
+    # Price from which the next BUY/SELL movement
+    # is calculated.
+    #
+    # This is persisted so a server restart does not
+    # silently create a new trading reference.
+    reference_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(32, 8),
+        nullable=True,
     )
 
     is_active: Mapped[bool] = mapped_column(
