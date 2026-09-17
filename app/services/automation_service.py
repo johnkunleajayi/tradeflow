@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.settings import settings
 from app.models.automation_rule import AutomationRule
 from app.services.market_data_service import MarketDataService
+from app.services.trade_service import TradeService
 
 
 class AutomationService:
@@ -44,6 +45,7 @@ class AutomationService:
     ):
         self.db = db
         self.market_data_service = MarketDataService()
+        self.trade_service = TradeService(db)
 
     @property
     def fee_rate(self) -> Decimal:
@@ -230,7 +232,10 @@ class AutomationService:
         """
         Resets automation to a clean inactive state.
 
-        All trading-cycle state is cleared.
+        A reset is not allowed while a position is open because
+        clearing the local position state while the corresponding
+        cryptocurrency remains on the live exchange could cause
+        TradeFlow to lose track of an actual live position.
 
         The configured price_step is preserved.
         """
@@ -241,6 +246,12 @@ class AutomationService:
             raise ValueError(
                 f"No automation rule exists for "
                 f"{symbol.upper()}."
+            )
+
+        if rule.position_open:
+            raise ValueError(
+                "Cannot reset automation while a position "
+                "is open. Close the position first."
             )
 
         rule.reference_price = None
@@ -270,6 +281,12 @@ class AutomationService:
             raise ValueError(
                 f"No automation rule exists for "
                 f"{symbol.upper()}."
+            )
+
+        if rule.position_open:
+            raise ValueError(
+                "Cannot delete an automation rule while "
+                "a position is open."
             )
 
         self.db.delete(rule)
@@ -506,6 +523,86 @@ class AutomationService:
         self.db.refresh(rule)
 
         return rule
+
+    def close_position_manually(
+        self,
+        symbol: str,
+    ):
+        """
+        Manually closes the currently tracked position.
+
+        The SELL is executed through TradeService first.
+
+        The automation position is cleared only after the
+        exchange execution succeeds.
+
+        The actual executed SELL price becomes the reference
+        price for the next BUY cycle.
+        """
+
+        rule = self.get_rule(symbol)
+
+        if rule is None:
+            raise ValueError(
+                f"No automation rule exists for "
+                f"{symbol.upper()}."
+            )
+
+        if not rule.position_open:
+            raise ValueError(
+                f"No open automation position exists "
+                f"for {rule.symbol}."
+            )
+
+        if (
+            rule.entry_quantity is None
+            or rule.entry_quantity <= 0
+        ):
+            raise ValueError(
+                "Open position has no valid entry quantity."
+            )
+
+        sell_response = self.trade_service.sell(
+            symbol=rule.symbol,
+            quantity=rule.entry_quantity,
+        )
+
+        if sell_response is None:
+            raise RuntimeError(
+                f"Manual SELL returned no result for "
+                f"{rule.symbol}."
+            )
+
+        executed_price = Decimal(
+            str(
+                sell_response.price
+            )
+        )
+
+        executed_quantity = Decimal(
+            str(
+                sell_response.quantity
+            )
+        )
+
+        if executed_price <= 0:
+            raise RuntimeError(
+                "Manual SELL returned an invalid "
+                "execution price."
+            )
+
+        if executed_quantity <= 0:
+            raise RuntimeError(
+                "Manual SELL returned an invalid "
+                "execution quantity."
+            )
+
+        self.close_position(
+            rule=rule,
+            reference_price=executed_price,
+        )
+
+        return sell_response
 
     def get_trigger_action(
         self,

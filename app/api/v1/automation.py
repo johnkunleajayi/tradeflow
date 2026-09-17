@@ -7,6 +7,7 @@ from app.schemas.automation import (
     AutomationRuleResponse,
     AutomationStatusResponse,
 )
+from app.schemas.trade import SellTradeResponse
 from app.services.automation_service import AutomationService
 
 
@@ -89,7 +90,8 @@ def stop_automation(
     db: Session = Depends(get_db),
 ):
     """
-    Stops automation while preserving the reference price.
+    Stops automation while preserving the reference price
+    and any open position.
     """
 
     service = AutomationService(db)
@@ -108,15 +110,38 @@ def reset_automation(
     """
     Resets automation to a clean inactive state.
 
-    This clears the persisted reference price and ensures
-    automation is inactive.
-
-    The configured price_step is preserved.
+    This operation is rejected while a position is open.
     """
 
     service = AutomationService(db)
 
     return service.reset(symbol)
+
+
+@router.post(
+    "/rules/{symbol}/close-position",
+    response_model=SellTradeResponse,
+)
+def close_automation_position(
+    symbol: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually closes the currently tracked automation position.
+
+    The SELL is executed through the configured execution
+    provider first.
+
+    The automation position is cleared only after a
+    successful SELL execution.
+
+    The actual SELL execution price becomes the reference
+    price for the next BUY cycle.
+    """
+
+    service = AutomationService(db)
+
+    return service.close_position_manually(symbol)
 
 
 @router.delete(

@@ -8,6 +8,9 @@ function App() {
   const [portfolio, setPortfolio] = useState(null)
   const [trades, setTrades] = useState([])
   const [error, setError] = useState(null)
+  const [actionMessage, setActionMessage] = useState(null)
+  const [actionError, setActionError] = useState(null)
+  const [actionLoading, setActionLoading] = useState(null)
 
   const fetchDashboard = async () => {
     try {
@@ -87,6 +90,156 @@ function App() {
 
     return () => clearInterval(interval)
   }, [])
+
+  const performAutomationAction = async (
+    action,
+    successMessage,
+  ) => {
+    setActionLoading(action)
+    setActionMessage(null)
+    setActionError(null)
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/automation/rules/BTC/${action}`,
+        {
+          method: 'POST',
+        },
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            data.message ||
+            `Automation action failed: ${response.status}`,
+        )
+      }
+
+      setActionMessage(successMessage)
+
+      await fetchDashboard()
+    } catch (err) {
+      setActionError(err.message)
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const handleStart = async () => {
+    await performAutomationAction(
+      'start',
+      'Automation started successfully.',
+    )
+  }
+
+  const handleStop = async () => {
+    if (
+      !window.confirm(
+        'Stop automation?\n\nThe current trading position and strategy state will be preserved.',
+      )
+    ) {
+      return
+    }
+
+    await performAutomationAction(
+      'stop',
+      'Automation stopped. Current strategy state has been preserved.',
+    )
+  }
+
+  const handleReset = async () => {
+    if (status?.position_open) {
+      setActionError(
+        'Reset is not available while a live position is open. Close the position first.',
+      )
+      return
+    }
+
+    const confirmed = window.confirm(
+      'Reset the automation strategy?\n\nThis will clear the reference price and all trading-cycle state. The automation will also be stopped.\n\nThis action cannot be undone.',
+    )
+
+    if (!confirmed) {
+      return
+    }
+
+    await performAutomationAction(
+      'reset',
+      'Automation strategy has been reset.',
+    )
+  }
+
+  const handleClosePosition = async () => {
+    if (!status?.position_open) {
+      setActionError(
+        'There is no open automation position to close.',
+      )
+      return
+    }
+
+    const quantity = formatCrypto(
+      status.entry_quantity,
+    )
+
+    const entryPrice = formatNgn(
+      status.entry_price,
+    )
+
+    const confirmed = window.confirm(
+      `CLOSE LIVE BTC POSITION?\n\nThis will submit a real SELL order to Quidax.\n\nQuantity: ${quantity} BTC\nEntry price: ${entryPrice}\n\nThe position will only be marked closed after the SELL executes successfully.\n\nContinue?`,
+    )
+
+    if (!confirmed) {
+      return
+    }
+
+    setActionLoading('close-position')
+    setActionMessage(null)
+    setActionError(null)
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/automation/rules/BTC/close-position`,
+        {
+          method: 'POST',
+        },
+      )
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          data.detail ||
+            data.message ||
+            `Close position failed: ${response.status}`,
+        )
+      }
+
+      const executedQuantity = formatCrypto(
+        data.quantity,
+      )
+
+      const executedPrice = formatNgn(
+        data.price,
+      )
+
+      const netProceeds = formatNgn(
+        data.net_value,
+      )
+
+      setActionMessage(
+        `Position closed successfully. Sold ${executedQuantity} BTC at ${executedPrice}. Net proceeds: ${netProceeds}.`,
+      )
+
+      await fetchDashboard()
+    } catch (err) {
+      setActionError(err.message)
+    } finally {
+      setActionLoading(null)
+    }
+  }
 
   const formatNgn = (value) => {
     if (
@@ -250,6 +403,154 @@ function App() {
             </span>
           </section>
         )}
+
+        {actionMessage && (
+          <section className="mt-5 rounded-xl border border-green-900 bg-green-950/20 px-5 py-4 text-sm text-green-300">
+            {actionMessage}
+          </section>
+        )}
+
+        {actionError && (
+          <section className="mt-5 rounded-xl border border-red-900 bg-red-950/20 px-5 py-4 text-sm text-red-300">
+            {actionError}
+          </section>
+        )}
+
+        <section className="mt-5 rounded-xl border border-gray-800 bg-[#11161d] p-5 sm:p-6">
+          <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+            <div>
+              <span className="mb-2 block text-[11px] font-bold tracking-[0.14em] text-gray-500">
+                AUTOMATION CONTROL
+              </span>
+
+              <h3 className="text-lg font-semibold tracking-tight text-gray-50">
+                Trading Engine
+              </h3>
+
+              <p className="mt-1 text-xs text-gray-600">
+                Control the automated BTC trading strategy.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={handleStart}
+                disabled={
+                  actionLoading !== null ||
+                  status?.is_active
+                }
+                className="rounded-lg border border-green-800 bg-green-500/10 px-4 py-2.5 text-xs font-bold text-green-300 transition hover:bg-green-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {actionLoading === 'start'
+                  ? 'Starting...'
+                  : 'Start Automation'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStop}
+                disabled={
+                  actionLoading !== null ||
+                  !status?.is_active
+                }
+                className="rounded-lg border border-yellow-800 bg-yellow-500/10 px-4 py-2.5 text-xs font-bold text-yellow-300 transition hover:bg-yellow-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {actionLoading === 'stop'
+                  ? 'Stopping...'
+                  : 'Stop Automation'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={
+                  actionLoading !== null ||
+                  status?.position_open
+                }
+                className="rounded-lg border border-red-900 bg-red-500/10 px-4 py-2.5 text-xs font-bold text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {actionLoading === 'reset'
+                  ? 'Resetting...'
+                  : 'Reset Strategy'}
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-5 rounded-xl border border-red-900/70 bg-[#11161d] p-5 sm:p-6">
+          <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+            <div>
+              <span className="mb-2 block text-[11px] font-bold tracking-[0.14em] text-red-500">
+                LIVE POSITION
+              </span>
+
+              <h3 className="text-lg font-semibold tracking-tight text-gray-50">
+                Position Management
+              </h3>
+
+              <p className="mt-1 max-w-xl text-xs leading-5 text-gray-600">
+                Manually close the current BTC position by
+                submitting a real SELL order to Quidax.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleClosePosition}
+              disabled={
+                actionLoading !== null ||
+                !status?.position_open
+              }
+              className="rounded-lg border border-red-800 bg-red-500/10 px-5 py-3 text-xs font-extrabold tracking-wide text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {actionLoading === 'close-position'
+                ? 'Closing Position...'
+                : 'Close Position'}
+            </button>
+          </div>
+
+          {status?.position_open && (
+            <div className="mt-5 grid grid-cols-1 gap-3 border-t border-gray-800 pt-5 sm:grid-cols-3">
+              <div>
+                <span className="block text-[11px] text-gray-600">
+                  Quantity
+                </span>
+
+                <strong className="mt-1 block text-sm text-gray-300">
+                  {formatCrypto(
+                    status.entry_quantity,
+                  )}{' '}
+                  BTC
+                </strong>
+              </div>
+
+              <div>
+                <span className="block text-[11px] text-gray-600">
+                  Entry Price
+                </span>
+
+                <strong className="mt-1 block text-sm text-gray-300">
+                  {formatNgn(
+                    status.entry_price,
+                  )}
+                </strong>
+              </div>
+
+              <div>
+                <span className="block text-[11px] text-gray-600">
+                  Current Target
+                </span>
+
+                <strong className="mt-1 block text-sm text-gray-300">
+                  {formatNgn(
+                    status.target_sell_price,
+                  )}
+                </strong>
+              </div>
+            </div>
+          )}
+        </section>
 
         <section className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {[
@@ -676,7 +977,8 @@ function App() {
           <button
             type="button"
             onClick={fetchDashboard}
-            className="rounded-lg border border-gray-700 bg-[#11161d] px-3 py-2 text-gray-300 transition hover:border-gray-600 hover:bg-gray-800"
+            disabled={actionLoading !== null}
+            className="rounded-lg border border-gray-700 bg-[#11161d] px-3 py-2 text-gray-300 transition hover:border-gray-600 hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             Refresh Now
           </button>
