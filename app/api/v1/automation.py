@@ -119,6 +119,29 @@ def reset_automation(
     return service.reset(symbol)
 
 
+@router.delete(
+    "/rules/{symbol}",
+)
+def delete_automation_rule(
+    symbol: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently deletes the automation rule for a symbol.
+    """
+
+    service = AutomationService(db)
+
+    service.delete_rule(symbol)
+
+    return {
+        "message": (
+            f"Automation rule for {symbol.upper()} "
+            "deleted successfully."
+        )
+    }
+
+
 @router.get(
     "/rules/{symbol}/status",
     response_model=AutomationStatusResponse,

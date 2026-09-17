@@ -9,7 +9,7 @@ class PortfolioAssetResponse(BaseModel):
             "example": {
                 "symbol": "BTC",
                 "quantity": "0.00250000",
-                "average_buy_price": "168000000.00",
+                "average_buy_price": None,
                 "current_price": "170500000.00",
                 "market_value": "426250.00",
             }
@@ -17,13 +17,20 @@ class PortfolioAssetResponse(BaseModel):
     )
 
     symbol: str = Field(examples=["BTC"])
-    quantity: Decimal = Field(examples=["0.00250000"])
-    average_buy_price: Decimal = Field(
-        examples=["168000000.00"]
+
+    quantity: Decimal = Field(
+        examples=["0.00250000"]
     )
+
+    average_buy_price: Decimal | None = Field(
+        default=None,
+        examples=[None],
+    )
+
     current_price: Decimal = Field(
         examples=["170500000.00"]
     )
+
     market_value: Decimal = Field(
         examples=["426250.00"]
     )
@@ -40,7 +47,7 @@ class PortfolioResponse(BaseModel):
                     {
                         "symbol": "BTC",
                         "quantity": "0.00250000",
-                        "average_buy_price": "168000000.00",
+                        "average_buy_price": None,
                         "current_price": "170500000.00",
                         "market_value": "426250.00",
                     }

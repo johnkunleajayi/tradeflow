@@ -1,17 +1,26 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from fastapi import APIRouter
 
-from app.db.dependencies import get_db
-from app.schemas.wallet import WalletResponse
-from app.services.wallet_service import WalletService
+from app.schemas.quidax import QuidaxBalancesResponse
+from app.services.quidax_account_service import (
+    QuidaxAccountService,
+)
+
 
 router = APIRouter(tags=["Wallet"])
 
 
 @router.get(
     "/wallet",
-    response_model=WalletResponse,
+    response_model=QuidaxBalancesResponse,
 )
-def get_wallet(db: Session = Depends(get_db)):
-    service = WalletService(db)
-    return service.get_wallet()
+def get_wallet():
+    """
+    Returns the live authenticated Quidax account balances.
+
+    Quidax is the sole source of truth for available
+    cryptocurrency and NGN balances.
+    """
+
+    service = QuidaxAccountService()
+
+    return service.get_balances()

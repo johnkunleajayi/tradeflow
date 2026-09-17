@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.core.settings import settings
 from app.models.automation_rule import AutomationRule
 from app.services.market_data_service import MarketDataService
 
@@ -13,15 +14,28 @@ class AutomationService:
     MVP strategy:
 
         BUY:
-            Current price <= reference price - price_step
+            When there is NO open position and the current
+            market price falls to or below:
+
+                reference_price - price_step
 
         SELL:
-            Current price >= reference price + (price_step * 2)
+            When there IS an open position and the current
+            market price reaches the calculated target_sell_price.
 
-    The actual trade is executed by TradeService.
+    The SELL target is calculated from the actual BUY execution.
 
-    The reference price is persisted in the database so
-    automation can safely survive application restarts.
+    The minimum required profit is:
+
+        AUTOMATION_MIN_PROFIT
+
+    The configured trading fee rate is included when calculating
+    the minimum profitable SELL price.
+
+    The actual exchange execution is handled by TradeService.
+
+    The automation rule persists the current trading-cycle state
+    so automation can safely survive application restarts.
     """
 
     def __init__(
@@ -30,6 +44,43 @@ class AutomationService:
     ):
         self.db = db
         self.market_data_service = MarketDataService()
+
+    @property
+    def fee_rate(self) -> Decimal:
+        """
+        Returns the configured trading fee rate.
+        """
+
+        return Decimal(
+            str(
+                settings.QUIDAX_TRADING_FEE_RATE
+            )
+        )
+
+    @property
+    def minimum_profit(self) -> Decimal:
+        """
+        Returns the minimum required net profit for an
+        automated trading cycle.
+        """
+
+        profit = Decimal(
+            str(
+                getattr(
+                    settings,
+                    "AUTOMATION_MIN_PROFIT",
+                    "75",
+                )
+            )
+        )
+
+        if profit <= 0:
+            raise ValueError(
+                "AUTOMATION_MIN_PROFIT must be greater "
+                "than zero."
+            )
+
+        return profit
 
     def get_rule(
         self,
@@ -83,6 +134,11 @@ class AutomationService:
             symbol=symbol,
             price_step=price_step,
             reference_price=None,
+            position_open=False,
+            entry_price=None,
+            entry_quantity=None,
+            entry_cost=None,
+            target_sell_price=None,
             is_active=False,
         )
 
@@ -99,10 +155,12 @@ class AutomationService:
         """
         Activates automation.
 
-        If no reference price exists, the current market
-        price becomes the initial reference price.
+        If no reference price exists and there is no open
+        position, the current market price becomes the initial
+        BUY reference.
 
-        Existing reference prices are preserved.
+        Existing reference prices and open positions are
+        preserved.
         """
 
         rule = self.get_rule(symbol)
@@ -113,7 +171,10 @@ class AutomationService:
                 f"{symbol.upper()}."
             )
 
-        if rule.reference_price is None:
+        if (
+            rule.reference_price is None
+            and not rule.position_open
+        ):
             current_price = (
                 self.market_data_service
                 .get_price(rule.symbol)
@@ -142,9 +203,9 @@ class AutomationService:
         """
         Stops automation.
 
-        The reference price is deliberately preserved so
-        restarting automation does not unexpectedly reset
-        the strategy.
+        The current reference price and any open position
+        are deliberately preserved so restarting automation
+        does not unexpectedly reset the trading cycle.
         """
 
         rule = self.get_rule(symbol)
@@ -169,9 +230,7 @@ class AutomationService:
         """
         Resets automation to a clean inactive state.
 
-        The reference price is cleared so that the next
-        activation obtains a fresh reference price from
-        the current market price.
+        All trading-cycle state is cleared.
 
         The configured price_step is preserved.
         """
@@ -185,6 +244,11 @@ class AutomationService:
             )
 
         rule.reference_price = None
+        rule.position_open = False
+        rule.entry_price = None
+        rule.entry_quantity = None
+        rule.entry_cost = None
+        rule.target_sell_price = None
         rule.is_active = False
 
         self.db.commit()
@@ -192,13 +256,35 @@ class AutomationService:
 
         return rule
 
+    def delete_rule(
+        self,
+        symbol: str,
+    ) -> None:
+        """
+        Permanently deletes the automation rule for a symbol.
+        """
+
+        rule = self.get_rule(symbol)
+
+        if rule is None:
+            raise ValueError(
+                f"No automation rule exists for "
+                f"{symbol.upper()}."
+            )
+
+        self.db.delete(rule)
+        self.db.commit()
+
     def set_reference_price(
         self,
         rule: AutomationRule,
         price: Decimal,
     ) -> AutomationRule:
         """
-        Updates the persisted automation reference price.
+        Updates the persisted BUY reference price.
+
+        Reference price is only used when TradeFlow does not
+        currently have an open position.
         """
 
         if price <= 0:
@@ -220,15 +306,15 @@ class AutomationService:
         """
         Returns the next BUY trigger price.
 
-        Strategy:
+        BUY is only available when there is no open position.
 
             BUY = reference price - price_step
-
-        If no reference price exists, there is no valid
-        BUY trigger.
         """
 
         if rule.reference_price is None:
+            return None
+
+        if rule.position_open:
             return None
 
         return (
@@ -236,31 +322,190 @@ class AutomationService:
             - rule.price_step
         )
 
+    def calculate_target_sell_price(
+        self,
+        rule: AutomationRule,
+    ) -> Decimal:
+        """
+        Calculates the minimum SELL price required to achieve
+        the configured net profit after the estimated SELL fee.
+
+        Required net proceeds:
+
+            entry_cost + minimum_profit
+
+        SELL net proceeds:
+
+            quantity * sell_price * (1 - fee_rate)
+
+        Therefore:
+
+            target_sell_price =
+                (entry_cost + minimum_profit)
+                /
+                (quantity * (1 - fee_rate))
+        """
+
+        if not rule.position_open:
+            raise ValueError(
+                "Cannot calculate a SELL target without "
+                "an open position."
+            )
+
+        if (
+            rule.entry_quantity is None
+            or rule.entry_quantity <= 0
+        ):
+            raise ValueError(
+                "Open position has no valid entry quantity."
+            )
+
+        if (
+            rule.entry_cost is None
+            or rule.entry_cost <= 0
+        ):
+            raise ValueError(
+                "Open position has no valid entry cost."
+            )
+
+        fee_rate = self.fee_rate
+
+        if fee_rate < 0:
+            raise ValueError(
+                "Trading fee rate cannot be negative."
+            )
+
+        if fee_rate >= 1:
+            raise ValueError(
+                "Trading fee rate must be less than 1."
+            )
+
+        fee_multiplier = (
+            Decimal("1")
+            - fee_rate
+        )
+
+        required_proceeds = (
+            rule.entry_cost
+            + self.minimum_profit
+        )
+
+        target_price = (
+            required_proceeds
+            / (
+                rule.entry_quantity
+                * fee_multiplier
+            )
+        )
+
+        if target_price <= 0:
+            raise ValueError(
+                "Calculated SELL target price must be "
+                "greater than zero."
+            )
+
+        return target_price
+
     def get_sell_trigger_price(
         self,
         rule: AutomationRule,
     ) -> Decimal | None:
         """
-        Returns the next SELL trigger price.
+        Returns the profitable SELL target for the current
+        open position.
 
-        Strategy:
-
-            SELL = reference price + (price_step * 2)
-
-        If no reference price exists, there is no valid
-        SELL trigger.
+        No SELL trigger exists when there is no open position.
         """
 
-        if rule.reference_price is None:
+        if not rule.position_open:
             return None
 
-        return (
-            rule.reference_price
-            + (
-                rule.price_step
-                * Decimal("2")
+        if rule.target_sell_price is not None:
+            return rule.target_sell_price
+
+        return self.calculate_target_sell_price(
+            rule
+        )
+
+    def set_position(
+        self,
+        rule: AutomationRule,
+        entry_price: Decimal,
+        entry_quantity: Decimal,
+        entry_cost: Decimal,
+    ) -> AutomationRule:
+        """
+        Opens a new automated trading position using the
+        actual completed BUY execution.
+
+        The profitable SELL target is calculated immediately.
+        """
+
+        if entry_price <= 0:
+            raise ValueError(
+                "Entry price must be greater than zero."
+            )
+
+        if entry_quantity <= 0:
+            raise ValueError(
+                "Entry quantity must be greater than zero."
+            )
+
+        if entry_cost <= 0:
+            raise ValueError(
+                "Entry cost must be greater than zero."
+            )
+
+        rule.position_open = True
+        rule.entry_price = entry_price
+        rule.entry_quantity = entry_quantity
+        rule.entry_cost = entry_cost
+
+        rule.target_sell_price = (
+            self.calculate_target_sell_price(
+                rule
             )
         )
+
+        self.db.commit()
+        self.db.refresh(rule)
+
+        return rule
+
+    def close_position(
+        self,
+        rule: AutomationRule,
+        reference_price: Decimal | None = None,
+    ) -> AutomationRule:
+        """
+        Closes the current automated trading position.
+
+        All position-specific state is cleared.
+
+        If a reference price is supplied, it becomes the anchor
+        for the next BUY cycle.
+        """
+
+        if reference_price is not None:
+
+            if reference_price <= 0:
+                raise ValueError(
+                    "Reference price must be greater "
+                    "than zero."
+                )
+
+            rule.reference_price = reference_price
+
+        rule.position_open = False
+        rule.entry_price = None
+        rule.entry_quantity = None
+        rule.entry_cost = None
+        rule.target_sell_price = None
+
+        self.db.commit()
+        self.db.refresh(rule)
+
+        return rule
 
     def get_trigger_action(
         self,
@@ -269,47 +514,49 @@ class AutomationService:
     ) -> str | None:
         """
         Determines whether the current price has triggered
-        a BUY or SELL.
+        a BUY or profitable SELL.
 
-        Strategy:
+        BUY:
+            Only when there is no open position.
 
-            BUY:
-                reference - price_step
-
-            SELL:
-                reference + (price_step * 2)
-
-        Returns:
-
-            BUY
-            SELL
-            None
+        SELL:
+            Only when there is an open position and the
+            current price reaches the calculated target price.
         """
 
         if not rule.is_active:
             return None
 
-        if rule.reference_price is None:
-            return None
-
         if current_price <= 0:
             return None
 
-        buy_trigger = (
-            self.get_buy_trigger_price(rule)
-        )
+        if rule.position_open:
 
-        sell_trigger = (
-            self.get_sell_trigger_price(rule)
-        )
+            sell_trigger = (
+                self.get_sell_trigger_price(
+                    rule
+                )
+            )
 
-        if buy_trigger is not None:
-            if current_price <= buy_trigger:
-                return "BUY"
-
-        if sell_trigger is not None:
-            if current_price >= sell_trigger:
+            if (
+                sell_trigger is not None
+                and current_price >= sell_trigger
+            ):
                 return "SELL"
+
+            return None
+
+        buy_trigger = (
+            self.get_buy_trigger_price(
+                rule
+            )
+        )
+
+        if (
+            buy_trigger is not None
+            and current_price <= buy_trigger
+        ):
+            return "BUY"
 
         return None
 
@@ -353,4 +600,10 @@ class AutomationService:
             "current_price": current_price,
             "next_buy_price": next_buy_price,
             "next_sell_price": next_sell_price,
+            "position_open": rule.position_open,
+            "entry_price": rule.entry_price,
+            "entry_quantity": rule.entry_quantity,
+            "entry_cost": rule.entry_cost,
+            "target_sell_price": rule.target_sell_price,
+            "minimum_profit": self.minimum_profit,
         }

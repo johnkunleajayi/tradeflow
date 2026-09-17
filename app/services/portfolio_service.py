@@ -2,16 +2,8 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import (
-    HoldingNotFoundError,
-    InsufficientBalanceError,
-    InsufficientHoldingError,
-    WalletNotFoundError,
-)
-from app.models.holding import Holding
 from app.models.trade import Trade
 from app.models.wallet import Wallet
-from app.repositories.holding_repository import HoldingRepository
 from app.repositories.trade_repository import TradeRepository
 from app.repositories.wallet_repository import WalletRepository
 from app.schemas.trade import (
@@ -23,22 +15,24 @@ from app.services.wallet_service import WalletService
 
 class PortfolioService:
     """
-    Handles local portfolio state.
+    Handles TradeFlow's local trade history.
+
+    For the LIVE trading MVP, Quidax is the sole source of truth
+    for cash and cryptocurrency balances.
+
+    This service does NOT maintain or modify local financial
+    balances or holdings for live trading.
 
     Responsibilities:
-    - Active wallet
-    - Cash balance
-    - Holdings
-    - Portfolio updates
-    - Trade recording
+    - Resolve the TradeFlow wallet record used for trade history.
+    - Record completed trade executions.
+    - Return trade execution responses.
 
-    This service does NOT communicate with Quidax.
-
-    The execution provider supplies actual completed
-    execution information.
-
-    This service then applies that execution to the
-    local TradeFlow portfolio.
+    Quidax is responsible for:
+    - Available NGN balance.
+    - Available cryptocurrency balances.
+    - Actual exchange-side holdings.
+    - Completed exchange execution.
     """
 
     def __init__(
@@ -48,10 +42,6 @@ class PortfolioService:
         self.db = db
 
         self.wallet_repository = WalletRepository(
-            db
-        )
-
-        self.holding_repository = HoldingRepository(
             db
         )
 
@@ -65,10 +55,13 @@ class PortfolioService:
 
     def get_active_wallet(self) -> Wallet:
         """
-        Returns the active wallet.
+        Returns the active TradeFlow wallet record.
 
-        If no active wallet exists, WalletService creates
-        or returns the default wallet.
+        The wallet record is retained only so that local trade
+        history has a wallet_id relationship.
+
+        Its cash_balance is NOT used as the source of truth
+        for LIVE trading.
         """
 
         wallet = (
@@ -81,229 +74,11 @@ class PortfolioService:
         wallet = self.wallet_service.get_wallet()
 
         if wallet is None:
-            raise WalletNotFoundError()
+            raise RuntimeError(
+                "Unable to resolve the active TradeFlow wallet."
+            )
 
         return wallet
-
-    def validate_cash_balance(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-    ) -> None:
-        """
-        Ensures the wallet has sufficient cash.
-        """
-
-        if amount <= 0:
-            raise ValueError(
-                "Trade amount must be greater than zero."
-            )
-
-        if wallet.cash_balance < amount:
-            raise InsufficientBalanceError()
-
-    def deduct_cash(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-    ) -> Wallet:
-        """
-        Deducts actual quote-currency cash spent.
-        """
-
-        if amount <= 0:
-            raise ValueError(
-                "Cash deduction amount must be greater "
-                "than zero."
-            )
-
-        if wallet.cash_balance < amount:
-            raise InsufficientBalanceError()
-
-        wallet.cash_balance -= amount
-
-        self.wallet_repository.save(
-            wallet
-        )
-
-        return wallet
-
-    def add_cash(
-        self,
-        wallet: Wallet,
-        amount: Decimal,
-    ) -> Wallet:
-        """
-        Adds actual NET cash proceeds.
-        """
-
-        if amount <= 0:
-            raise ValueError(
-                "Cash addition amount must be greater "
-                "than zero."
-            )
-
-        wallet.cash_balance += amount
-
-        self.wallet_repository.save(
-            wallet
-        )
-
-        return wallet
-
-    def create_or_update_holding(
-        self,
-        wallet: Wallet,
-        symbol: str,
-        quantity: Decimal,
-        price: Decimal,
-    ) -> Holding:
-        """
-        Creates or updates a holding using the NET asset
-        quantity actually received.
-        """
-
-        if quantity <= 0:
-            raise ValueError(
-                "Holding quantity must be greater than zero."
-            )
-
-        if price <= 0:
-            raise ValueError(
-                "Holding price must be greater than zero."
-            )
-
-        symbol = symbol.upper()
-
-        holding = (
-            self.holding_repository
-            .get_by_wallet_and_symbol(
-                wallet.id,
-                symbol,
-            )
-        )
-
-        if holding is None:
-            holding = Holding(
-                wallet_id=wallet.id,
-                symbol=symbol,
-                quantity=quantity,
-                average_buy_price=price,
-            )
-
-            self.holding_repository.save(
-                holding
-            )
-
-            return holding
-
-        total_quantity = (
-            holding.quantity + quantity
-        )
-
-        total_cost = (
-            holding.quantity
-            * holding.average_buy_price
-        ) + (
-            quantity * price
-        )
-
-        holding.average_buy_price = (
-            total_cost / total_quantity
-        )
-
-        holding.quantity = total_quantity
-
-        self.holding_repository.save(
-            holding
-        )
-
-        return holding
-
-    def get_holding_for_sell(
-        self,
-        wallet: Wallet,
-        symbol: str,
-    ) -> Holding:
-        """
-        Gets the holding required for a SELL.
-        """
-
-        symbol = symbol.upper()
-
-        holding = (
-            self.holding_repository
-            .get_by_wallet_and_symbol(
-                wallet.id,
-                symbol,
-            )
-        )
-
-        if holding is None:
-            raise HoldingNotFoundError(
-                symbol
-            )
-
-        return holding
-
-    def validate_holding_quantity(
-        self,
-        holding: Holding,
-        quantity: Decimal,
-    ) -> None:
-        """
-        Ensures enough asset is available for the
-        requested SELL.
-        """
-
-        if quantity <= 0:
-            raise ValueError(
-                "Sell quantity must be greater than zero."
-            )
-
-        if holding.quantity < quantity:
-            raise InsufficientHoldingError(
-                holding.symbol
-            )
-
-    def reduce_holding(
-        self,
-        holding: Holding,
-        quantity: Decimal,
-    ) -> Holding | None:
-        """
-        Reduces the holding by the ACTUAL executed
-        quantity.
-
-        If remaining quantity is zero, the holding
-        is deleted.
-        """
-
-        if quantity <= 0:
-            raise ValueError(
-                "Holding reduction quantity must be greater "
-                "than zero."
-            )
-
-        if holding.quantity < quantity:
-            raise InsufficientHoldingError(
-                holding.symbol
-            )
-
-        holding.quantity -= quantity
-
-        if holding.quantity <= 0:
-            self.holding_repository.delete(
-                holding
-            )
-
-            return None
-
-        self.holding_repository.save(
-            holding
-        )
-
-        return holding
 
     def record_trade(
         self,
@@ -320,17 +95,10 @@ class PortfolioService:
         """
         Records the actual completed exchange execution.
 
-        total_value:
-            Gross execution value.
+        This creates a historical TradeFlow record only.
 
-        fee:
-            Actual trading fee applied to the execution.
-
-        fee_currency:
-            Currency in which the fee was charged.
-
-        net_value:
-            Net quote value after fee where applicable.
+        It does not modify local cash or cryptocurrency
+        balances.
         """
 
         if quantity <= 0:
@@ -389,26 +157,32 @@ class PortfolioService:
         fee: Decimal = Decimal("0"),
         fee_currency: str = "NGN",
         net_value: Decimal | None = None,
+        live_execution: bool = False,
     ) -> BuyTradeResponse:
         """
-        Records a completed BUY using actual execution
-        information.
+        Records a completed BUY.
 
-        For a BUY:
+        LIVE mode:
+            Quidax is authoritative for the actual transaction.
+            TradeFlow records the completed execution only.
 
-        - amount = actual quote currency spent
-        - gross_quantity = cryptocurrency before fee
-        - quantity = cryptocurrency actually received
-        - fee = trading fee
-        - fee_currency = normally base cryptocurrency
+        PAPER mode:
+            The current MVP does not maintain local financial
+            balances here. Paper trading can be reintroduced
+            later as a separate simulation layer.
         """
 
-        wallet = self.get_active_wallet()
+        if amount <= 0:
+            raise ValueError(
+                "Trade amount must be greater than zero."
+            )
 
-        self.validate_cash_balance(
-            wallet,
-            amount,
-        )
+        if quantity <= 0:
+            raise ValueError(
+                "Trade quantity must be greater than zero."
+            )
+
+        wallet = self.get_active_wallet()
 
         if gross_quantity is None:
             gross_quantity = quantity + fee
@@ -417,21 +191,6 @@ class PortfolioService:
             net_value = amount
 
         try:
-            # Actual quote amount spent.
-            self.deduct_cash(
-                wallet,
-                amount,
-            )
-
-            # Net cryptocurrency received after any
-            # base-asset trading fee.
-            self.create_or_update_holding(
-                wallet=wallet,
-                symbol=symbol,
-                quantity=quantity,
-                price=price,
-            )
-
             trade = self.record_trade(
                 wallet=wallet,
                 symbol=symbol,
@@ -445,10 +204,6 @@ class PortfolioService:
             )
 
             self.db.commit()
-
-            self.db.refresh(
-                wallet
-            )
 
             self.db.refresh(
                 trade
@@ -478,32 +233,33 @@ class PortfolioService:
         fee: Decimal = Decimal("0"),
         fee_currency: str = "NGN",
         net_amount: Decimal | None = None,
+        live_execution: bool = False,
     ) -> SellTradeResponse:
         """
-        Records a completed SELL using actual execution
-        information.
+        Records a completed SELL.
 
-        For a SELL:
+        LIVE mode:
+            Quidax is authoritative for the actual transaction.
+            TradeFlow records the completed execution only.
 
-        - quantity = actual cryptocurrency sold
-        - gross_amount = gross quote proceeds
-        - fee = actual quote-currency trading fee
-        - net_amount = cash actually received
+        No local holding is checked or reduced.
+
+        No local cash balance is increased.
         """
+
+        if quantity <= 0:
+            raise ValueError(
+                "Sell quantity must be greater than zero."
+            )
+
+        if price <= 0:
+            raise ValueError(
+                "Sell price must be greater than zero."
+            )
 
         wallet = self.get_active_wallet()
 
         try:
-            holding = self.get_holding_for_sell(
-                wallet,
-                symbol,
-            )
-
-            self.validate_holding_quantity(
-                holding,
-                quantity,
-            )
-
             if gross_amount is None:
                 gross_amount = (
                     quantity * price
@@ -529,19 +285,6 @@ class PortfolioService:
                     "Net sell proceeds must be greater than zero."
                 )
 
-            # Remove the actual cryptocurrency quantity
-            # filled by the exchange.
-            self.reduce_holding(
-                holding,
-                quantity,
-            )
-
-            # Add only the actual NET quote proceeds.
-            self.add_cash(
-                wallet,
-                net_amount,
-            )
-
             trade = self.record_trade(
                 wallet=wallet,
                 symbol=symbol,
@@ -555,10 +298,6 @@ class PortfolioService:
             )
 
             self.db.commit()
-
-            self.db.refresh(
-                wallet
-            )
 
             self.db.refresh(
                 trade

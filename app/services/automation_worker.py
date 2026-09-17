@@ -1,6 +1,7 @@
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
+import requests
 from sqlalchemy.orm import Session
 
 from app.core.settings import settings
@@ -8,6 +9,9 @@ from app.db.database import SessionLocal
 from app.models.automation_rule import AutomationRule
 from app.services.automation_service import AutomationService
 from app.services.market_data_service import MarketDataService
+from app.services.providers.quidax_market_provider import (
+    QuidaxMarketProvider,
+)
 from app.services.quidax_account_service import QuidaxAccountService
 from app.services.trade_service import TradeService
 
@@ -19,65 +23,59 @@ class AutomationWorker:
     """
     Background worker for TradeFlow automated trading.
 
-    Strategy:
+    Trading cycle:
 
-        BUY:
-            Current price <= reference price - price_step.
+        1. No open position:
+               Wait for the market price to fall to the
+               BUY trigger.
 
-        SELL:
-            Current price >= reference price + (price_step * 2).
+        2. BUY:
+               Purchase the configured fixed NGN amount.
 
-    Safety behaviour:
+        3. Open position:
+               Record the actual Quidax execution price,
+               quantity, and cost.
 
-        - Insufficient NGN for BUY:
-              Skip trade safely.
+        4. SELL:
+               Wait until the current price reaches the
+               calculated profitable SELL target.
 
-        - Insufficient crypto for SELL:
-              Skip trade safely.
+        5. Close position:
+               Sell only the quantity acquired by the
+               current TradeFlow trading cycle.
 
-        - Quidax/API execution failure:
-              Log the failure and keep the worker alive.
+        6. New cycle:
+               Use the completed SELL price as the anchor
+               for the next BUY opportunity.
 
-        - Successful trade:
-              Move the automation reference price to the
-              actual execution price.
+    Profitability rule:
 
-        - Skipped/failed trade:
-              Keep the existing reference price.
+        Every automated SELL must target at least:
 
-    The worker never owns exchange execution logic.
-    TradeService remains responsible for actual BUY/SELL execution.
+            AUTOMATION_MIN_PROFIT
 
-    The worker deliberately does not hardcode trade amounts.
-
-    BUY:
-        Uses the currently available NGN balance.
-
-    SELL:
-        Uses the currently available balance of the
-        cryptocurrency being traded.
-
-    Quidax precision normalization remains the responsibility
-    of QuidaxExecutionProvider.
+        in net NGN profit after the configured trading fee.
 
     LIVE TRADING SAFETY:
 
-        By default, the worker runs in SAFE/DRY-RUN mode.
+        Automated BUYs use:
 
-        When a trigger is detected, it will:
+            AUTOMATION_TRADE_AMOUNT
 
-            - retrieve the real Quidax balance
-            - calculate the actual dynamic amount/quantity
-            - log the intended trade
+        Automated SELLs use only the cryptocurrency quantity
+        recorded for the current TradeFlow position.
 
-        But it will NOT send the order to Quidax unless:
+        TradeFlow never uses the entire Quidax NGN balance
+        for an automated BUY.
+
+        TradeFlow never sells unrelated cryptocurrency
+        holdings.
+
+        In SAFE/DRY-RUN mode, no real Quidax orders are submitted.
+
+        Real automated trading requires:
 
             AUTOMATION_LIVE_TRADING=true
-
-        is explicitly configured.
-
-        This prevents the automation worker from accidentally
-        executing a real trade while the strategy is being tested.
     """
 
     def __init__(self):
@@ -85,6 +83,10 @@ class AutomationWorker:
 
         self.quidax_account_service = (
             QuidaxAccountService()
+        )
+
+        self.quidax_market_provider = (
+            QuidaxMarketProvider()
         )
 
         self.running = False
@@ -111,12 +113,6 @@ class AutomationWorker:
         """
         Determines whether the automation worker is allowed
         to submit real orders to Quidax.
-
-        SAFE MODE is the default.
-
-        Real automated trading requires:
-
-            AUTOMATION_LIVE_TRADING=true
         """
 
         value = getattr(
@@ -135,12 +131,33 @@ class AutomationWorker:
             "on",
         }
 
+    @property
+    def trade_amount(self) -> Decimal:
+        """
+        Returns the fixed NGN amount used for each automated BUY.
+        """
+
+        amount = Decimal(
+            str(
+                getattr(
+                    settings,
+                    "AUTOMATION_TRADE_AMOUNT",
+                    "1250",
+                )
+            )
+        )
+
+        if amount <= 0:
+            raise ValueError(
+                "AUTOMATION_TRADE_AMOUNT must be greater "
+                "than zero."
+            )
+
+        return amount
+
     def start(self) -> None:
         """
         Starts the automation worker.
-
-        The worker runs in a daemon thread so it does not
-        prevent the application from shutting down.
         """
 
         if self.running:
@@ -189,8 +206,8 @@ class AutomationWorker:
         """
         Main automation loop.
 
-        Any error from an individual cycle is caught so
-        that the background worker remains alive.
+        Any unexpected error from an individual cycle is caught
+        so that the background worker remains alive.
         """
 
         while self.running:
@@ -275,15 +292,52 @@ class AutomationWorker:
     ) -> None:
         """
         Evaluates one automation rule.
+
+        The worker evaluates only one side of the trading
+        cycle at a time:
+
+            No position:
+                BUY logic.
+
+            Open position:
+                SELL logic.
+
+        A temporary Quidax market-data/network failure is treated
+        as a skipped cycle rather than a trading-rule failure.
         """
 
         symbol = rule.symbol.upper()
 
-        current_price = (
-            self.market_data_service
-            .get_price(symbol)
-            .price
-        )
+        try:
+            current_price = (
+                self.market_data_service
+                .get_price(symbol)
+                .price
+            )
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Unable to retrieve current market price "
+                "for %s from Quidax. "
+                "Skipping this automation cycle. "
+                "The worker will retry automatically. "
+                "Reason: %s",
+                symbol,
+                exc,
+            )
+            return
+
+        except Exception as exc:
+            logger.warning(
+                "Unable to retrieve current market price "
+                "for %s. "
+                "Skipping this automation cycle. "
+                "The worker will retry automatically. "
+                "Reason: %s",
+                symbol,
+                exc,
+            )
+            return
 
         if current_price <= 0:
             logger.warning(
@@ -294,23 +348,31 @@ class AutomationWorker:
 
             return
 
-        # Initialize the reference price if required.
-        #
-        # This normally happens immediately after an
-        # inactive rule is activated.
-        if rule.reference_price is None:
-
+        if (
+            not rule.position_open
+            and rule.reference_price is None
+        ):
             rule.reference_price = current_price
 
             db.commit()
 
             logger.info(
-                "Automation reference initialized: "
+                "Automation BUY reference initialized: "
                 "%s = %s",
                 symbol,
                 current_price,
             )
 
+            return
+
+        action = (
+            automation_service.get_trigger_action(
+                rule=rule,
+                current_price=current_price,
+            )
+        )
+
+        if action is None:
             return
 
         buy_trigger_price = (
@@ -325,21 +387,12 @@ class AutomationWorker:
             )
         )
 
-        action = (
-            automation_service.get_trigger_action(
-                rule=rule,
-                current_price=current_price,
-            )
-        )
-
-        if action is None:
-            return
-
         logger.info(
             "Automation trigger detected: "
             "%s %s at market price %s "
             "(reference=%s, step=%s, "
-            "buy_trigger=%s, sell_trigger=%s, "
+            "buy_trigger=%s, sell_target=%s, "
+            "position_open=%s, trade_amount=%s, "
             "live_trading=%s)",
             action,
             symbol,
@@ -348,6 +401,8 @@ class AutomationWorker:
             rule.price_step,
             buy_trigger_price,
             sell_trigger_price,
+            rule.position_open,
+            self.trade_amount,
             self.live_trading_enabled,
         )
 
@@ -355,6 +410,7 @@ class AutomationWorker:
 
             self._execute_buy(
                 db=db,
+                automation_service=automation_service,
                 trade_service=trade_service,
                 rule=rule,
                 current_price=current_price,
@@ -366,6 +422,7 @@ class AutomationWorker:
 
             self._execute_sell(
                 db=db,
+                automation_service=automation_service,
                 trade_service=trade_service,
                 rule=rule,
                 current_price=current_price,
@@ -376,24 +433,31 @@ class AutomationWorker:
     def _execute_buy(
         self,
         db: Session,
+        automation_service: AutomationService,
         trade_service: TradeService,
         rule: AutomationRule,
         current_price: Decimal,
     ) -> None:
         """
-        Attempts an automated BUY.
+        Executes an automated BUY.
 
-        The worker uses the currently available NGN balance.
+        BUYs are allowed only when no position is currently open.
 
-        It does NOT calculate or hardcode a fixed trade amount.
+        The configured fixed NGN amount is used.
 
-        In SAFE/DRY-RUN mode, the dynamic balance is retrieved
-        and logged but no real order is submitted.
-
-        QuidaxExecutionProvider is responsible for normalizing
-        the resulting amount to the exchange's current
-        quote-currency precision.
+        After successful execution, the actual Quidax
+        execution details are persisted as the open position.
         """
+
+        if rule.position_open:
+
+            logger.warning(
+                "BUY skipped for %s: "
+                "an automated position is already open.",
+                rule.symbol,
+            )
+
+            return
 
         try:
             balance_response = (
@@ -401,11 +465,26 @@ class AutomationWorker:
                 .get_balances()
             )
 
-        except Exception:
-            logger.exception(
-                "Unable to retrieve Quidax balances. "
-                "BUY skipped for %s.",
+        except requests.RequestException as exc:
+            logger.warning(
+                "Unable to retrieve Quidax balances "
+                "for BUY of %s. "
+                "BUY skipped; worker will retry automatically. "
+                "Reason: %s",
                 rule.symbol,
+                exc,
+            )
+
+            return
+
+        except Exception as exc:
+            logger.warning(
+                "Unable to retrieve Quidax balances "
+                "for BUY of %s. "
+                "BUY skipped; worker will retry automatically. "
+                "Reason: %s",
+                rule.symbol,
+                exc,
             )
 
             return
@@ -415,12 +494,17 @@ class AutomationWorker:
             "NGN",
         )
 
-        if ngn_balance <= 0:
+        trade_amount = self.trade_amount
+
+        if ngn_balance < trade_amount:
 
             logger.warning(
                 "BUY skipped for %s: "
-                "insufficient available NGN balance.",
+                "available NGN=%s is below the "
+                "configured automation trade amount=%s.",
                 rule.symbol,
+                ngn_balance,
+                trade_amount,
             )
 
             return
@@ -431,26 +515,26 @@ class AutomationWorker:
         )
 
         logger.info(
-            "Automation BUY trigger detected for %s. "
+            "Automation BUY opportunity for %s. "
             "Current price=%s, reference=%s, "
             "BUY trigger=%s, available NGN=%s, "
-            "live_trading=%s",
+            "trade amount=%s, live_trading=%s",
             rule.symbol,
             current_price,
             rule.reference_price,
             buy_trigger_price,
             ngn_balance,
+            trade_amount,
             self.live_trading_enabled,
         )
 
         if not self.live_trading_enabled:
             logger.warning(
                 "SAFE/DRY-RUN: BUY NOT EXECUTED for %s. "
-                "Would submit dynamic available NGN amount=%s "
-                "to TradeService. "
+                "Would submit fixed NGN amount=%s. "
                 "No Quidax order was sent.",
                 rule.symbol,
-                ngn_balance,
+                trade_amount,
             )
 
             return
@@ -459,8 +543,20 @@ class AutomationWorker:
 
             execution = trade_service.buy(
                 symbol=rule.symbol,
-                amount=ngn_balance,
+                amount=trade_amount,
             )
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Automated BUY request failed for %s. "
+                "No position state was changed. "
+                "Worker will retry on a future trigger cycle. "
+                "Reason: %s",
+                rule.symbol,
+                exc,
+            )
+
+            return
 
         except Exception:
             logger.exception(
@@ -479,58 +575,156 @@ class AutomationWorker:
             )
         )
 
+        execution_quantity = Decimal(
+            str(
+                execution.quantity
+            )
+        )
+
+        execution_cost = Decimal(
+            str(
+                execution.amount
+            )
+        )
+
         if execution_price <= 0:
             logger.error(
                 "Automated BUY returned an invalid "
                 "execution price for %s. "
-                "Reference price will remain unchanged.",
+                "Position will not be opened.",
                 rule.symbol,
             )
 
             return
 
-        previous_reference = (
-            rule.reference_price
-        )
+        if execution_quantity <= 0:
+            logger.error(
+                "Automated BUY returned an invalid "
+                "execution quantity for %s. "
+                "Position will not be opened.",
+                rule.symbol,
+            )
 
-        rule.reference_price = execution_price
+            return
 
-        db.commit()
+        if execution_cost <= 0:
+            logger.error(
+                "Automated BUY returned an invalid "
+                "execution cost for %s. "
+                "Position will not be opened.",
+                rule.symbol,
+            )
+
+            return
+
+        try:
+
+            automation_service.set_position(
+                rule=rule,
+                entry_price=execution_price,
+                entry_quantity=execution_quantity,
+                entry_cost=execution_cost,
+            )
+
+        except Exception:
+            db.rollback()
+
+            logger.exception(
+                "Automated BUY completed on Quidax, "
+                "but TradeFlow could not persist the "
+                "position state for %s.",
+                rule.symbol,
+            )
+
+            return
 
         logger.info(
             "Automated BUY completed successfully: "
-            "%s quantity=%s price=%s "
-            "previous_reference=%s "
-            "new_reference=%s",
+            "%s quantity=%s entry_price=%s "
+            "entry_cost=%s target_sell_price=%s",
             rule.symbol,
-            execution.quantity,
+            execution_quantity,
             execution_price,
-            previous_reference,
-            rule.reference_price,
+            execution_cost,
+            rule.target_sell_price,
         )
 
     def _execute_sell(
         self,
         db: Session,
+        automation_service: AutomationService,
         trade_service: TradeService,
         rule: AutomationRule,
         current_price: Decimal,
     ) -> None:
         """
-        Attempts an automated SELL.
+        Executes an automated SELL.
 
-        The worker uses the currently available cryptocurrency
-        balance.
+        Only the quantity recorded for the current TradeFlow
+        position may be sold.
 
-        It does NOT hardcode the quantity.
+        The worker verifies that the actual Quidax balance
+        still contains enough of the asset.
 
-        In SAFE/DRY-RUN mode, the dynamic balance is retrieved
-        and logged but no real order is submitted.
-
-        QuidaxExecutionProvider is responsible for rounding
-        the quantity DOWN according to Quidax's current
-        base-asset precision.
+        The SELL is allowed only when the current price has
+        reached the profitable target.
         """
+
+        if not rule.position_open:
+
+            logger.warning(
+                "SELL skipped for %s: "
+                "no TradeFlow position is open.",
+                rule.symbol,
+            )
+
+            return
+
+        if (
+            rule.entry_quantity is None
+            or rule.entry_quantity <= 0
+        ):
+
+            logger.error(
+                "SELL skipped for %s: "
+                "open position has no valid entry quantity.",
+                rule.symbol,
+            )
+
+            return
+
+        if (
+            rule.entry_cost is None
+            or rule.entry_cost <= 0
+        ):
+
+            logger.error(
+                "SELL skipped for %s: "
+                "open position has no valid entry cost.",
+                rule.symbol,
+            )
+
+            return
+
+        target_sell_price = (
+            automation_service.get_sell_trigger_price(
+                rule
+            )
+        )
+
+        if target_sell_price is None:
+
+            logger.error(
+                "SELL skipped for %s: "
+                "no valid target SELL price exists.",
+                rule.symbol,
+            )
+
+            return
+
+        if current_price < target_sell_price:
+
+            return
 
         try:
             balance_response = (
@@ -538,60 +732,161 @@ class AutomationWorker:
                 .get_balances()
             )
 
-        except Exception:
-            logger.exception(
-                "Unable to retrieve Quidax balances. "
-                "SELL skipped for %s.",
+        except requests.RequestException as exc:
+            logger.warning(
+                "Unable to retrieve Quidax balances "
+                "for SELL of %s. "
+                "SELL skipped; worker will retry automatically. "
+                "Reason: %s",
                 rule.symbol,
+                exc,
             )
 
             return
 
-        quantity = self._get_available_balance(
-            balance_response,
-            rule.symbol,
+        except Exception as exc:
+            logger.warning(
+                "Unable to retrieve Quidax balances "
+                "for SELL of %s. "
+                "SELL skipped; worker will retry automatically. "
+                "Reason: %s",
+                rule.symbol,
+                exc,
+            )
+
+            return
+
+        available_balance = (
+            self._get_available_balance(
+                balance_response,
+                rule.symbol,
+            )
         )
 
-        if quantity <= 0:
+        sell_quantity = min(
+            rule.entry_quantity,
+            available_balance,
+        )
+
+        if sell_quantity <= 0:
 
             logger.warning(
                 "SELL skipped for %s: "
-                "insufficient available %s balance.",
+                "no available Quidax %s balance.",
                 rule.symbol,
                 rule.symbol,
             )
 
             return
 
-        sell_trigger_price = (
-            rule.reference_price
-            + (
-                rule.price_step
-                * Decimal("2")
+        try:
+            rules = (
+                self.quidax_market_provider
+                .get_market_rules(
+                    rule.symbol
+                )
             )
+
+            base_precision = self._get_precision(
+                rules,
+                "base_precision",
+                8,
+            )
+
+            minimum_order_size = (
+                self._get_minimum_order_size(
+                    rules
+                )
+            )
+
+            normalized_quantity = (
+                self._quantize_down(
+                    sell_quantity,
+                    base_precision
+                )
+            )
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Unable to retrieve Quidax market rules "
+                "for SELL of %s. "
+                "SELL skipped; worker will retry automatically. "
+                "Reason: %s",
+                rule.symbol,
+                exc,
+            )
+
+            return
+
+        except Exception:
+            logger.exception(
+                "Unable to validate Quidax SELL rules "
+                "for %s. SELL skipped.",
+                rule.symbol,
+            )
+
+            return
+
+        if normalized_quantity <= 0:
+
+            logger.info(
+                "SELL skipped for %s: position quantity=%s "
+                "becomes zero after Quidax base precision "
+                "normalization to %s decimal places.",
+                rule.symbol,
+                sell_quantity,
+                base_precision,
+            )
+
+            return
+
+        estimated_quote_value = (
+            normalized_quantity
+            * current_price
         )
 
+        if (
+            minimum_order_size > 0
+            and estimated_quote_value
+            < minimum_order_size
+        ):
+
+            logger.info(
+                "SELL skipped for %s: normalized position "
+                "quantity=%s has estimated value=%s NGN, "
+                "below Quidax minimum order value=%s NGN.",
+                rule.symbol,
+                normalized_quantity,
+                estimated_quote_value,
+                minimum_order_size,
+            )
+
+            return
+
         logger.info(
-            "Automation SELL trigger detected for %s. "
-            "Current price=%s, reference=%s, "
-            "SELL trigger=%s, available quantity=%s, "
+            "Automation profitable SELL opportunity for %s. "
+            "Current price=%s, target=%s, "
+            "entry_price=%s, entry_cost=%s, "
+            "position_quantity=%s, sell_quantity=%s, "
             "live_trading=%s",
             rule.symbol,
             current_price,
-            rule.reference_price,
-            sell_trigger_price,
-            quantity,
+            target_sell_price,
+            rule.entry_price,
+            rule.entry_cost,
+            rule.entry_quantity,
+            normalized_quantity,
             self.live_trading_enabled,
         )
 
         if not self.live_trading_enabled:
             logger.warning(
                 "SAFE/DRY-RUN: SELL NOT EXECUTED for %s. "
-                "Would submit dynamic available quantity=%s "
-                "to TradeService. "
-                "No Quidax order was sent.",
+                "Would sell quantity=%s at market price "
+                "around %s. No Quidax order was sent.",
                 rule.symbol,
-                quantity,
+                normalized_quantity,
+                current_price,
             )
 
             return
@@ -600,16 +895,29 @@ class AutomationWorker:
 
             execution = trade_service.sell(
                 symbol=rule.symbol,
-                quantity=quantity,
+                quantity=normalized_quantity,
             )
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "Automated SELL request failed for %s. "
+                "Position remains open. "
+                "Worker will retry when the target condition "
+                "is still satisfied. "
+                "Reason: %s",
+                rule.symbol,
+                exc,
+            )
+
+            return
 
         except Exception:
             logger.exception(
                 "Automated SELL failed for %s. "
-                "Reference price will remain unchanged "
-                "at %s.",
+                "Position remains open and target "
+                "price remains %s.",
                 rule.symbol,
-                rule.reference_price,
+                target_sell_price,
             )
 
             return
@@ -624,31 +932,150 @@ class AutomationWorker:
             logger.error(
                 "Automated SELL returned an invalid "
                 "execution price for %s. "
-                "Reference price will remain unchanged.",
+                "Position remains open.",
                 rule.symbol,
             )
 
             return
 
+        previous_entry_cost = (
+            rule.entry_cost
+        )
+
+        actual_net_amount = Decimal(
+            str(
+                execution.amount
+            )
+        )
+
+        actual_profit = (
+            actual_net_amount
+            - previous_entry_cost
+        )
+
+        minimum_profit = (
+            automation_service.minimum_profit
+        )
+
+        if actual_profit < minimum_profit:
+
+            logger.error(
+                "Automated SELL completed for %s, but "
+                "reported net profit=%s is below the "
+                "required minimum profit=%s. "
+                "The position will be closed because "
+                "the exchange execution has already completed.",
+                rule.symbol,
+                actual_profit,
+                minimum_profit,
+            )
+
         previous_reference = (
             rule.reference_price
         )
 
-        rule.reference_price = execution_price
-
-        db.commit()
+        automation_service.close_position(
+            rule=rule,
+            reference_price=execution_price,
+        )
 
         logger.info(
             "Automated SELL completed successfully: "
             "%s quantity=%s price=%s "
+            "net_amount=%s previous_entry_cost=%s "
+            "actual_net_profit=%s "
             "previous_reference=%s "
             "new_reference=%s",
             rule.symbol,
             execution.quantity,
             execution_price,
+            actual_net_amount,
+            previous_entry_cost,
+            actual_profit,
             previous_reference,
             rule.reference_price,
         )
+
+    @staticmethod
+    def _quantize_down(
+        value: Decimal,
+        precision: int,
+    ) -> Decimal:
+        """
+        Rounds a quantity DOWN to the specified number of
+        decimal places.
+        """
+
+        quantum = Decimal("1").scaleb(
+            -precision
+        )
+
+        return value.quantize(
+            quantum,
+            rounding=ROUND_DOWN,
+        )
+
+    @staticmethod
+    def _get_precision(
+        rules: dict,
+        key: str,
+        default: int,
+    ) -> int:
+        """
+        Safely extracts a precision value from Quidax rules.
+        """
+
+        value = rules.get(
+            key,
+            default,
+        )
+
+        try:
+            precision = int(value)
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                f"Invalid Quidax {key}: {value!r}"
+            ) from exc
+
+        if precision < 0:
+            raise ValueError(
+                f"Invalid Quidax {key}: {precision}"
+            )
+
+        return precision
+
+    @staticmethod
+    def _get_minimum_order_size(
+        rules: dict,
+    ) -> Decimal:
+        """
+        Extracts Quidax's minimum order size.
+        """
+
+        value = rules.get(
+            "minimum_order_size",
+            "0",
+        )
+
+        try:
+            minimum = Decimal(
+                str(value)
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Invalid Quidax minimum_order_size: "
+                f"{value!r}"
+            ) from exc
+
+        if minimum < 0:
+            raise ValueError(
+                "Quidax minimum order size cannot be negative."
+            )
+
+        return minimum
 
     @staticmethod
     def _get_available_balance(
@@ -661,12 +1088,6 @@ class AutomationWorker:
         Available balance:
 
             balance - locked
-
-        Locked funds are excluded because they cannot safely
-        be used for a new automated order.
-
-        The returned value remains dynamic. No trade amount
-        is hardcoded by the automation worker.
         """
 
         currency = currency.upper()

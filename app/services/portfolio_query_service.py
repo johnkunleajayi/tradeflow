@@ -2,27 +2,31 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import WalletNotFoundError
-from app.models.holding import Holding
-from app.repositories.holding_repository import HoldingRepository
-from app.repositories.wallet_repository import WalletRepository
 from app.schemas.portfolio import (
     PortfolioAssetResponse,
     PortfolioResponse,
 )
 from app.services.providers.provider_factory import ProviderFactory
-from app.services.wallet_service import WalletService
+from app.services.quidax_account_service import (
+    QuidaxAccountService,
+)
 
 
 class PortfolioQueryService:
     """
-    Provides portfolio read operations.
+    Provides live portfolio read operations.
+
+    For the LIVE MVP, Quidax is the sole source of truth
+    for account balances.
+
+    This service does not use the local Wallet or Holding
+    records to determine portfolio balances.
 
     Responsibilities:
-    - Portfolio valuation
-    - Holdings valuation
-    - Dashboard data
-    - Portfolio reporting
+    - Retrieve live Quidax balances.
+    - Retrieve current market prices.
+    - Calculate crypto market values.
+    - Calculate total portfolio value.
 
     This service NEVER modifies portfolio data.
     """
@@ -30,77 +34,80 @@ class PortfolioQueryService:
     def __init__(self, db: Session):
         self.db = db
 
-        self.wallet_repository = WalletRepository(db)
-        self.holding_repository = HoldingRepository(db)
-        self.wallet_service = WalletService(db)
-
         self.market_provider = ProviderFactory.create()
 
-    def get_active_wallet(self):
-        """
-        Returns the active wallet.
-
-        If no wallet exists, the default Paper Wallet
-        is created automatically.
-        """
-
-        wallet = self.wallet_repository.get_active_wallet()
-
-        if wallet is not None:
-            return wallet
-
-        wallet = self.wallet_service.get_wallet()
-
-        if wallet is None:
-            raise WalletNotFoundError()
-
-        return wallet
+        self.quidax_account_service = (
+            QuidaxAccountService()
+        )
 
     def get_portfolio(self) -> PortfolioResponse:
         """
-        Returns the current portfolio summary using
-        the configured market data provider.
+        Returns the current live portfolio summary.
+
+        Quidax provides the actual account balances.
+
+        Current market prices are used to calculate the
+        NGN value of cryptocurrency balances.
         """
 
-        wallet = self.get_active_wallet()
-
-        holdings = (
-            self.holding_repository.get_all_by_wallet(
-                wallet.id
-            )
+        balances_response = (
+            self.quidax_account_service.get_balances()
         )
+
+        cash_balance = Decimal("0")
 
         assets: list[PortfolioAssetResponse] = []
 
-        holdings_value = Decimal("0.00")
+        holdings_value = Decimal("0")
 
-        for holding in holdings:
-            current_price = self.market_provider.get_price(
-                holding.symbol
+        for balance in balances_response.balances:
+            currency = balance.currency.upper()
+
+            available_balance = (
+                balance.balance - balance.locked
+            )
+
+            if available_balance < 0:
+                available_balance = Decimal("0")
+
+            if currency == "NGN":
+                cash_balance = available_balance
+                continue
+
+            if currency not in {"BTC", "ETH", "SOL"}:
+                continue
+
+            if available_balance <= 0:
+                continue
+
+            current_price = (
+                self.market_provider.get_price(
+                    currency
+                )
             )
 
             market_value = (
-                holding.quantity * current_price
+                available_balance * current_price
             )
 
             holdings_value += market_value
 
             assets.append(
                 PortfolioAssetResponse(
-                    symbol=holding.symbol,
-                    quantity=holding.quantity,
-                    average_buy_price=holding.average_buy_price,
+                    symbol=currency,
+                    quantity=available_balance,
+                    average_buy_price=None,
                     current_price=current_price,
                     market_value=market_value,
                 )
             )
 
         total_portfolio_value = (
-            wallet.cash_balance + holdings_value
+            cash_balance + holdings_value
         )
 
         return PortfolioResponse(
-            cash_balance=wallet.cash_balance,
+            cash_balance=cash_balance,
             holdings_value=holdings_value,
             total_portfolio_value=total_portfolio_value,
             assets=assets,

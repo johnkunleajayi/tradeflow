@@ -50,7 +50,15 @@ class Settings(BaseSettings):
     #
     # Even when TRADING_MODE=live, automated trading remains
     # disabled unless this is explicitly true.
-    AUTOMATION_LIVE_TRADING: bool = False
+    AUTOMATION_LIVE_TRADING: bool = True
+
+    # Fixed amount of NGN used for each automated BUY.
+    #
+    # The worker will never spend the entire available
+    # Quidax NGN balance on an automated BUY.
+    AUTOMATION_TRADE_AMOUNT: Decimal = Decimal(
+        "1250"
+    )
 
     QUIDAX_BASE_URL: str = (
         "https://openapi.quidax.io/exchange-open-api/api/v1"
@@ -71,6 +79,13 @@ class Settings(BaseSettings):
     # Quidax market orders are taker orders.
     QUIDAX_TRADING_FEE_RATE: Decimal = Decimal(
         "0.001"
+    )
+    
+        # Minimum net profit required before an automated SELL.
+    #
+    # This is measured in NGN after estimated trading fees.
+    AUTOMATION_MIN_PROFIT: Decimal = Decimal(
+        "75"
     )
 
 

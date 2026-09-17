@@ -1,17 +1,61 @@
-from sqlalchemy.orm import Session
-
-from app.models.holding import Holding
+from app.schemas.holding import HoldingResponse
+from app.services.quidax_account_service import (
+    QuidaxAccountService,
+)
 
 
 class HoldingService:
-    """Handles holding-related business logic."""
+    """
+    Provides live cryptocurrency holdings.
 
-    def __init__(self, db: Session):
-        self.db = db
+    Quidax is the sole source of truth for cryptocurrency
+    balances.
 
-    def get_holdings(self) -> list[Holding]:
+    The database session is accepted for compatibility with
+    the existing API dependency pattern, but it is not used.
+    """
+
+    SUPPORTED_CRYPTOCURRENCIES = {
+        "BTC",
+        "ETH",
+        "SOL",
+    }
+
+    def __init__(self, db=None):
+        self.quidax_account_service = (
+            QuidaxAccountService()
+        )
+
+    def get_holdings(self) -> list[HoldingResponse]:
         """
-        Returns all crypto holdings.
+        Returns the available live cryptocurrency balances
+        from Quidax.
         """
 
-        return self.db.query(Holding).all()
+        balances_response = (
+            self.quidax_account_service.get_balances()
+        )
+
+        holdings: list[HoldingResponse] = []
+
+        for balance in balances_response.balances:
+            currency = balance.currency.upper()
+
+            if currency not in self.SUPPORTED_CRYPTOCURRENCIES:
+                continue
+
+            available_balance = (
+                balance.balance - balance.locked
+            )
+
+            if available_balance <= 0:
+                continue
+
+            holdings.append(
+                HoldingResponse(
+                    symbol=currency,
+                    quantity=available_balance,
+                )
+            )
+
+        return holdings

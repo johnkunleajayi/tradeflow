@@ -47,3 +47,15 @@ class AutomationStatusResponse(BaseModel):
     next_buy_price: Decimal | None = None
 
     next_sell_price: Decimal | None = None
+
+    position_open: bool = False
+
+    entry_price: Decimal | None = None
+
+    entry_quantity: Decimal | None = None
+
+    entry_cost: Decimal | None = None
+
+    target_sell_price: Decimal | None = None
+
+    minimum_profit: Decimal | None = None
